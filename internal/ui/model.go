@@ -1024,9 +1024,9 @@ func (m Model) viewContainerDetail() string {
 	} else {
 		// Column headers
 		b.WriteString(styleHighlight.Render("  Status  "))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s ", "Image")))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s ", "Tag")))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s ", "Lokal")))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Image")))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s  ", "Tag")))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s  ", "Lokal")))
 		b.WriteString(styleHighlight.Render("Repository"))
 		b.WriteString("\n")
 		b.WriteString(styleMuted.Render("  ──────  ────────────────────  ────────────  ───────────────  ──────────────"))
@@ -1058,7 +1058,7 @@ func (m Model) viewContainerDetail() string {
 				statusStyle = styleHighlight
 			}
 
-			b.WriteString(statusStyle.Render(fmt.Sprintf("  %s     ", status)))
+			b.WriteString(statusStyle.Render(fmt.Sprintf("  %-6s  ", status)))
 			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s  ", imgName)))
 			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", imgTag)))
 			b.WriteString(fmt.Sprintf("%-15s  ", img.CurrentVersion))
