@@ -1,0 +1,29 @@
+# Binaries
+docker-compose-manager
+docker-compose-manager-*
+
+# Go
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Cache
+.docker-compose-manager-cache.json
+cache.json
+.cache/
+/var/cache/docker-compose-manager/
+
+# OS
+.DS_Store
+Thumbs.db

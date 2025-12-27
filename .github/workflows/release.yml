@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Get version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          # Linux AMD64
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o docker-compose-manager-linux-amd64 ./cmd
+
+          # Linux ARM64
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o docker-compose-manager-linux-arm64 ./cmd
+
+          # macOS AMD64 (Intel)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o docker-compose-manager-darwin-amd64 ./cmd
+
+          # macOS ARM64 (M1/M2)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o docker-compose-manager-darwin-arm64 ./cmd
+
+      - name: Create checksums
+        run: |
+          sha256sum docker-compose-manager-* > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            docker-compose-manager-linux-amd64
+            docker-compose-manager-linux-arm64
+            docker-compose-manager-darwin-amd64
+            docker-compose-manager-darwin-arm64
+            checksums.txt
+            install.sh
+          body: |
+            ## Installation
+
+            ### Quick Install (Linux/macOS)
+            ```bash
+            curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo bash
+            ```
+
+            ### Manual Install
+            1. Download the binary for your platform
+            2. Make it executable: `chmod +x docker-compose-manager-*`
+            3. Move to PATH: `sudo mv docker-compose-manager-* /usr/local/bin/docker-compose-manager`
+
+            ### Verify Installation
+            ```bash
+            docker-compose-manager --help
+            ```
+
+            ## What's New
+            See commit history for details.
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
