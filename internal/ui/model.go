@@ -764,23 +764,28 @@ func (m Model) viewUpdateList() string {
 			nameStyle = styleHighlight
 		}
 
-		// If no image info, try to fetch it from running containers
-		if len(project.ImageInfo) == 0 {
-			project.GetRunningContainerInfo()
-		}
-
 		// Get image info
 		if len(project.ImageInfo) == 0 {
-			// Still no image info - show project name only
+			// No image info - show project name only with message to refresh
 			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
 			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
 			b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s", project.Name)))
 			b.WriteString(spinner)
-			b.WriteString(styleMuted.Render("  (no containers running)"))
+			b.WriteString(styleMuted.Render("  (press 'r' to load versions)"))
 			b.WriteString("\n")
 		} else {
+			// Check if project has any updates
+			hasUpdates := false
+			for _, img := range project.ImageInfo {
+				if img.HasUpdate {
+					hasUpdates = true
+					break
+				}
+			}
+
 			// Show first image on same line as project name
 			firstImg := true
+			imgCount := 0
 			for _, img := range project.ImageInfo {
 				// Extract image name and tag
 				imgName := img.Name
@@ -798,14 +803,18 @@ func (m Model) viewUpdateList() string {
 				}
 
 				if firstImg {
-					// First image: show with project name
+					// First image: show with project name and update indicator
+					updateIndicator := "  "
+					if hasUpdates {
+						updateIndicator = "⬆ "
+					}
 					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
 					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
-					b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s  ", project.Name)))
+					b.WriteString(nameStyle.Render(fmt.Sprintf("%-18s%s", project.Name, updateIndicator)))
 					firstImg = false
 				} else {
 					// Additional images: indent
-					b.WriteString(fmt.Sprintf("%s %s %-20s  ", " ", "   ", ""))
+					b.WriteString(fmt.Sprintf("  %s %-20s", "   ", ""))
 				}
 
 				// Version info with color coding
@@ -824,9 +833,16 @@ func (m Model) viewUpdateList() string {
 				b.WriteString(fmt.Sprintf("%-15s  ", localVersion))
 				b.WriteString(versionStyle.Render(repoVersion))
 
-				if firstImg && spinner != "" {
+				if imgCount == 0 && spinner != "" {
 					b.WriteString(spinner)
 				}
+				b.WriteString("\n")
+				imgCount++
+			}
+
+			// Add separator line after each project (except last)
+			if i < len(m.projects)-1 {
+				b.WriteString(styleMuted.Render("  ┄ ──── ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
 				b.WriteString("\n")
 			}
 		}

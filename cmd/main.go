@@ -14,7 +14,7 @@ import (
 const (
 	defaultSearchDir = "/home/dockeruser/docker"
 	defaultMaxDepth  = 10
-	cacheMaxAge      = 1 * time.Hour
+	cacheMaxAge      = 24 * time.Hour // Cache valid for 24 hours
 )
 
 // getCacheFile returns the cache file path
