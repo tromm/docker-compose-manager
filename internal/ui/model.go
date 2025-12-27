@@ -730,22 +730,23 @@ func (m Model) viewUpdateList() string {
 	}
 
 	// Table header
-	b.WriteString(styleHighlight.Render("    "))
+	b.WriteString(styleHighlight.Render("  "))
+	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-4s ", "Sel")))
 	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Project")))
 	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Image")))
 	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s  ", "Tag")))
 	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s  ", "Lokal")))
 	b.WriteString(styleHighlight.Render("Repository"))
 	b.WriteString("\n")
-	b.WriteString(styleMuted.Render("  ─ ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
+	b.WriteString(styleMuted.Render("  ─ ──── ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
 	b.WriteString("\n")
 
 	for i, project := range m.projects {
 		cursor := " "
-		checkbox := " "
+		checkbox := "[ ]"
 
 		if m.selectedUpdates[i] {
-			checkbox = "✓"
+			checkbox = "[✓]"
 		}
 
 		// Show spinner if this project is currently being checked
@@ -763,14 +764,19 @@ func (m Model) viewUpdateList() string {
 			nameStyle = styleHighlight
 		}
 
+		// If no image info, try to fetch it from running containers
+		if len(project.ImageInfo) == 0 {
+			project.GetRunningContainerInfo()
+		}
+
 		// Get image info
 		if len(project.ImageInfo) == 0 {
-			// No image info - show project name only
-			b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s", cursor)))
-			b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s ", checkbox)))
+			// Still no image info - show project name only
+			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
+			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
 			b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s", project.Name)))
 			b.WriteString(spinner)
-			b.WriteString(styleMuted.Render("  (no image info)"))
+			b.WriteString(styleMuted.Render("  (no containers running)"))
 			b.WriteString("\n")
 		} else {
 			// Show first image on same line as project name
@@ -793,13 +799,13 @@ func (m Model) viewUpdateList() string {
 
 				if firstImg {
 					// First image: show with project name
-					b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s", cursor)))
-					b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s ", checkbox)))
+					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
+					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
 					b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s  ", project.Name)))
 					firstImg = false
 				} else {
 					// Additional images: indent
-					b.WriteString(fmt.Sprintf(" %s %s %-20s  ", " ", " ", ""))
+					b.WriteString(fmt.Sprintf("%s %s %-20s  ", " ", "   ", ""))
 				}
 
 				// Version info with color coding
