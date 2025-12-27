@@ -1022,31 +1022,47 @@ func (m Model) viewContainerDetail() string {
 		b.WriteString(styleMuted.Render("No containers running or unable to fetch container information."))
 		b.WriteString("\n")
 	} else {
+		// Column headers
+		b.WriteString(styleHighlight.Render("  Status  "))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s ", "Image")))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s ", "Tag")))
+		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s ", "Lokal")))
+		b.WriteString(styleHighlight.Render("Repository"))
+		b.WriteString("\n")
+		b.WriteString(styleMuted.Render("  ──────  ────────────────────  ────────────  ───────────────  ──────────────"))
+		b.WriteString("\n")
+
 		for _, img := range m.selectedProject.ImageInfo {
-			// Extract image name
+			// Extract image name and tag
 			imgName := img.Name
+			imgTag := "latest"
+
 			if strings.Contains(imgName, "/") {
 				parts := strings.Split(imgName, "/")
 				imgName = parts[len(parts)-1]
 			}
-			// Remove tag from display name
+
+			// Extract tag from image name
 			if strings.Contains(imgName, ":") {
-				imgName = strings.Split(imgName, ":")[0]
+				parts := strings.Split(imgName, ":")
+				imgName = parts[0]
+				imgTag = parts[1]
 			}
 
 			// Show image with version
 			status := "✓"
 			statusStyle := styleSuccess
-			versionText := fmt.Sprintf("%s → %s", img.CurrentVersion, img.LatestVersion)
 
 			if img.HasUpdate {
 				status = "⬆"
 				statusStyle = styleHighlight
 			}
 
-			b.WriteString(statusStyle.Render(fmt.Sprintf("  %s ", status)))
-			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s ", imgName)))
-			b.WriteString(fmt.Sprintf("%s\n", versionText))
+			b.WriteString(statusStyle.Render(fmt.Sprintf("  %s     ", status)))
+			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s  ", imgName)))
+			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", imgTag)))
+			b.WriteString(fmt.Sprintf("%-15s  ", img.CurrentVersion))
+			b.WriteString(fmt.Sprintf("%s\n", img.LatestVersion))
 		}
 	}
 
