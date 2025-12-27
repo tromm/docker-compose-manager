@@ -729,78 +729,101 @@ func (m Model) viewUpdateList() string {
 		b.WriteString("\n\n")
 	}
 
+	// Table header
+	b.WriteString(styleHighlight.Render("    "))
+	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Project")))
+	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Image")))
+	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s  ", "Tag")))
+	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s  ", "Lokal")))
+	b.WriteString(styleHighlight.Render("Repository"))
+	b.WriteString("\n")
+	b.WriteString(styleMuted.Render("  ─ ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
+	b.WriteString("\n")
+
 	for i, project := range m.projects {
 		cursor := " "
-		checkbox := "[ ]"
-		name := project.Name
+		checkbox := " "
 
 		if m.selectedUpdates[i] {
-			checkbox = "[✓]"
+			checkbox = "✓"
 		}
-
-		paddedName := fmt.Sprintf("%-20s", name)
 
 		// Show spinner if this project is currently being checked
 		spinner := ""
 		if m.checkingUpdates && m.currentCheckIndex == i {
-			spinner = styleInfo.Render(" ⏳")
+			spinner = " ⏳"
 		}
 
-		// Show version info for ALL images (not just those with updates)
-		updateInfo := ""
-		if len(project.ImageInfo) > 0 {
-			imageCount := len(project.ImageInfo)
-			updateCount := 0
-
-			// Collect version details for ALL images
-			var versions []string
-			for _, img := range project.ImageInfo {
-				// Extract just the image name without registry
-				imgShortName := img.Name
-				if strings.Contains(imgShortName, "/") {
-					parts := strings.Split(imgShortName, "/")
-					imgShortName = parts[len(parts)-1]
-				}
-				// Remove tag from name for display
-				if strings.Contains(imgShortName, ":") {
-					imgShortName = strings.Split(imgShortName, ":")[0]
-				}
-
-				// Show version for this image
-				var versionInfo string
-				if img.HasUpdate {
-					updateCount++
-					versionInfo = fmt.Sprintf("%s: %s → %s", imgShortName, img.CurrentVersion, img.LatestVersion)
-				} else {
-					// Show current version even if no update
-					versionInfo = fmt.Sprintf("%s: %s", imgShortName, img.CurrentVersion)
-				}
-				versions = append(versions, versionInfo)
-			}
-
-			if updateCount > 0 {
-				// Show version details
-				if imageCount == 1 {
-					updateInfo = styleSuccess.Render(fmt.Sprintf(" [%s]", versions[0]))
-				} else {
-					updateInfo = styleSuccess.Render(fmt.Sprintf(" [%s]", strings.Join(versions, "; ")))
-				}
-			} else if imageCount > 0 {
-				// No updates but show versions anyway
-				if imageCount == 1 {
-					updateInfo = styleMuted.Render(fmt.Sprintf(" [%s]", versions[0]))
-				} else {
-					updateInfo = styleMuted.Render(fmt.Sprintf(" [%s]", strings.Join(versions, "; ")))
-				}
-			}
-		}
-
+		// Determine style based on cursor position
+		cursorStyle := lipgloss.NewStyle()
+		nameStyle := styleInfo
 		if m.cursor == i {
-			cursor = styleHighlight.Render(">")
-			paddedName = styleHighlight.Render(paddedName)
+			cursor = "›"
+			cursorStyle = styleHighlight
+			nameStyle = styleHighlight
 		}
 
-		b.WriteString(fmt.Sprintf("%s %s %s%s%s\n", cursor, checkbox, paddedName, spinner, updateInfo))
+		// Get image info
+		if len(project.ImageInfo) == 0 {
+			// No image info - show project name only
+			b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s", cursor)))
+			b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s ", checkbox)))
+			b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s", project.Name)))
+			b.WriteString(spinner)
+			b.WriteString(styleMuted.Render("  (no image info)"))
+			b.WriteString("\n")
+		} else {
+			// Show first image on same line as project name
+			firstImg := true
+			for _, img := range project.ImageInfo {
+				// Extract image name and tag
+				imgName := img.Name
+				imgTag := "latest"
+
+				if strings.Contains(imgName, "/") {
+					parts := strings.Split(imgName, "/")
+					imgName = parts[len(parts)-1]
+				}
+
+				if strings.Contains(imgName, ":") {
+					parts := strings.Split(imgName, ":")
+					imgName = parts[0]
+					imgTag = parts[1]
+				}
+
+				if firstImg {
+					// First image: show with project name
+					b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s", cursor)))
+					b.WriteString(cursorStyle.Render(fmt.Sprintf(" %s ", checkbox)))
+					b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s  ", project.Name)))
+					firstImg = false
+				} else {
+					// Additional images: indent
+					b.WriteString(fmt.Sprintf(" %s %s %-20s  ", " ", " ", ""))
+				}
+
+				// Version info with color coding
+				localVersion := img.CurrentVersion
+				repoVersion := img.LatestVersion
+				versionStyle := lipgloss.NewStyle()
+
+				if img.HasUpdate {
+					versionStyle = styleSuccess
+				} else {
+					versionStyle = styleMuted
+				}
+
+				b.WriteString(versionStyle.Render(fmt.Sprintf("%-20s  ", imgName)))
+				b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", imgTag)))
+				b.WriteString(fmt.Sprintf("%-15s  ", localVersion))
+				b.WriteString(versionStyle.Render(repoVersion))
+
+				if firstImg && spinner != "" {
+					b.WriteString(spinner)
+				}
+				b.WriteString("\n")
+			}
+		}
 	}
 
 	b.WriteString("\n")
