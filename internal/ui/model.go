@@ -15,6 +15,7 @@ type Screen int
 const (
 	ScreenMainMenu Screen = iota
 	ScreenContainerList
+	ScreenContainerDetail       // Show containers in a project (aptitude-style)
 	ScreenActionMenu
 	ScreenUpdateList
 	ScreenUpdateModeSelect      // Choose: Pull only or Pull & Restart
@@ -22,6 +23,7 @@ const (
 	ScreenUpdateConfirm         // Old confirmation (kept for compatibility)
 	ScreenUpdating
 	ScreenLoading
+	ScreenHelp                  // Help & Documentation screen
 	ScreenConfirmExit
 )
 
@@ -124,7 +126,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.success {
 			m.updateProgress += fmt.Sprintf("✓ %s updated successfully (%d/%d)\n", msg.projectName, m.updatesCompleted, m.updatesTotal)
 		} else {
-			m.updateProgress += fmt.Sprintf("✗ %s failed: %v (%d/%d)\n", msg.projectName, msg.err, m.updatesCompleted, m.updatesTotal)
+			m.updateProgress += styleError.Render(fmt.Sprintf("✗ %s failed: %v (%d/%d)\n", msg.projectName, msg.err, m.updatesCompleted, m.updatesTotal))
 		}
 
 		// Check if all updates are done
@@ -182,8 +184,20 @@ func (m Model) handleBack() (tea.Model, tea.Cmd) {
 		m.message = ""
 		return m, nil
 
-	case ScreenActionMenu:
+	case ScreenContainerDetail:
 		m.screen = ScreenContainerList
+		m.cursor = 0
+		m.message = ""
+		return m, nil
+
+	case ScreenActionMenu:
+		m.screen = ScreenContainerDetail
+		m.cursor = 0
+		m.message = ""
+		return m, nil
+
+	case ScreenHelp:
+		m.screen = ScreenMainMenu
 		m.cursor = 0
 		m.message = ""
 		return m, nil
@@ -297,18 +311,25 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case 2: // Help & Documentation
-			m.message = "Help: Use arrow keys or 1-3 keys to navigate, Enter to select, Esc/q to go back"
+			m.screen = ScreenHelp
+			m.cursor = 0
 			return m, nil
 		}
 
 	case ScreenContainerList:
 		if m.cursor < len(m.projects) {
 			m.selectedProject = m.projects[m.cursor]
-			m.screen = ScreenActionMenu
+			m.screen = ScreenContainerDetail
 			m.cursor = 0
 			m.message = ""
 			return m, nil
 		}
+
+	case ScreenContainerDetail:
+		// From container detail, go to action menu
+		m.screen = ScreenActionMenu
+		m.cursor = 0
+		return m, nil
 
 	case ScreenActionMenu:
 		return m.handleAction()
@@ -512,6 +533,8 @@ func (m Model) View() string {
 		return m.viewMainMenu()
 	case ScreenContainerList:
 		return m.viewContainerList()
+	case ScreenContainerDetail:
+		return m.viewContainerDetail()
 	case ScreenActionMenu:
 		return m.viewActionMenu()
 	case ScreenUpdateList:
@@ -526,6 +549,8 @@ func (m Model) View() string {
 		return m.viewUpdating()
 	case ScreenLoading:
 		return m.viewLoading()
+	case ScreenHelp:
+		return m.viewHelp()
 	case ScreenConfirmExit:
 		return m.viewConfirmExit()
 	}
@@ -721,42 +746,52 @@ func (m Model) viewUpdateList() string {
 			spinner = styleInfo.Render(" ⏳")
 		}
 
-		// Show update info if available
+		// Show version info for ALL images (not just those with updates)
 		updateInfo := ""
 		if len(project.ImageInfo) > 0 {
 			imageCount := len(project.ImageInfo)
 			updateCount := 0
 
-			// Collect version details
+			// Collect version details for ALL images
 			var versions []string
 			for _, img := range project.ImageInfo {
+				// Extract just the image name without registry
+				imgShortName := img.Name
+				if strings.Contains(imgShortName, "/") {
+					parts := strings.Split(imgShortName, "/")
+					imgShortName = parts[len(parts)-1]
+				}
+				// Remove tag from name for display
+				if strings.Contains(imgShortName, ":") {
+					imgShortName = strings.Split(imgShortName, ":")[0]
+				}
+
+				// Show version for this image
+				var versionInfo string
 				if img.HasUpdate {
 					updateCount++
-					// Show image name with version info
-					// Extract just the image name without registry
-					imgShortName := img.Name
-					if strings.Contains(imgShortName, "/") {
-						parts := strings.Split(imgShortName, "/")
-						imgShortName = parts[len(parts)-1]
-					}
-					// Remove tag from name for display
-					if strings.Contains(imgShortName, ":") {
-						imgShortName = strings.Split(imgShortName, ":")[0]
-					}
-					versionInfo := fmt.Sprintf("%s: %s → %s", imgShortName, img.CurrentVersion, img.LatestVersion)
-					versions = append(versions, versionInfo)
+					versionInfo = fmt.Sprintf("%s: %s → %s", imgShortName, img.CurrentVersion, img.LatestVersion)
+				} else {
+					// Show current version even if no update
+					versionInfo = fmt.Sprintf("%s: %s", imgShortName, img.CurrentVersion)
 				}
+				versions = append(versions, versionInfo)
 			}
 
 			if updateCount > 0 {
-				// Show version details if only one update, otherwise just count
-				if updateCount == 1 {
+				// Show version details
+				if imageCount == 1 {
 					updateInfo = styleSuccess.Render(fmt.Sprintf(" [%s]", versions[0]))
 				} else {
-					updateInfo = styleSuccess.Render(fmt.Sprintf(" [%d updates: %s]", updateCount, strings.Join(versions, "; ")))
+					updateInfo = styleSuccess.Render(fmt.Sprintf(" [%s]", strings.Join(versions, "; ")))
 				}
 			} else if imageCount > 0 {
-				updateInfo = styleMuted.Render(" ✓")
+				// No updates but show versions anyway
+				if imageCount == 1 {
+					updateInfo = styleMuted.Render(fmt.Sprintf(" [%s]", versions[0]))
+				} else {
+					updateInfo = styleMuted.Render(fmt.Sprintf(" [%s]", strings.Join(versions, "; ")))
+				}
 			}
 		}
 
@@ -900,6 +935,118 @@ func (m Model) viewUpdating() string {
 	if m.updateProgress != "" {
 		b.WriteString(m.updateProgress)
 	}
+
+	return styleBox.Render(b.String())
+}
+
+// viewHelp renders the help and documentation screen
+func (m Model) viewHelp() string {
+	var b strings.Builder
+	b.WriteString(styleTitle.Render("Help & Documentation"))
+	b.WriteString("\n\n")
+
+	b.WriteString(styleHighlight.Render("🎯 Overview"))
+	b.WriteString("\n")
+	b.WriteString("Docker Compose Manager is a terminal UI for managing Docker Compose projects.\n")
+	b.WriteString("It provides an easy way to start, stop, restart containers and update images.\n\n")
+
+	b.WriteString(styleHighlight.Render("⌨️  Keyboard Shortcuts"))
+	b.WriteString("\n")
+	b.WriteString("  ↑/↓ or k/j      Navigate menu items\n")
+	b.WriteString("  1, 2, 3         Direct menu selection (main menu only)\n")
+	b.WriteString("  Enter           Select item / Confirm action\n")
+	b.WriteString("  Space           Toggle selection (in update/restart lists)\n")
+	b.WriteString("  a               Select all / Deselect all (in lists)\n")
+	b.WriteString("  r               Refresh update check (in update screen)\n")
+	b.WriteString("  Esc or q        Go back to previous screen\n")
+	b.WriteString("  Ctrl+C          Force quit application\n\n")
+
+	b.WriteString(styleHighlight.Render("📋 Features"))
+	b.WriteString("\n")
+	b.WriteString("  • Container Management: Start, stop, restart individual projects\n")
+	b.WriteString("  • Update Management: Pull latest images with optional restart\n")
+	b.WriteString("  • Dual Update Modes:\n")
+	b.WriteString("    - Pull Images Only: Download new images without restarting\n")
+	b.WriteString("    - Pull & Restart: Download and recreate containers\n")
+	b.WriteString("  • Cache System: Fast startup with background update checks\n")
+	b.WriteString("  • Version Display: Shows current and available versions\n")
+	b.WriteString("  • Multi-Select: Update multiple projects at once\n\n")
+
+	b.WriteString(styleHighlight.Render("🔄 Update Workflow"))
+	b.WriteString("\n")
+	b.WriteString("  1. Select \"Perform Updates\" from main menu\n")
+	b.WriteString("  2. Select projects to update (Space to toggle, 'a' for all)\n")
+	b.WriteString("  3. Choose update mode (pull only or pull & restart)\n")
+	b.WriteString("  4. If restart mode: confirm which containers to restart\n")
+	b.WriteString("  5. View progress and results\n\n")
+
+	b.WriteString(styleHighlight.Render("💡 Tips"))
+	b.WriteString("\n")
+	b.WriteString("  • Use 'r' in update screen to manually refresh available updates\n")
+	b.WriteString("  • Cache age shown in update screen - use --update-cache flag for cron\n")
+	b.WriteString("  • Press Enter on a project to view its containers and versions\n")
+	b.WriteString("  • Red ✗ indicates update failures, green ✓ indicates success\n\n")
+
+	b.WriteString(styleHelp.Render("Press Esc or q to return to main menu"))
+
+	return styleBox.Render(b.String())
+}
+
+// viewContainerDetail renders detailed view of containers in a project
+func (m Model) viewContainerDetail() string {
+	if m.selectedProject == nil {
+		return styleError.Render("No project selected")
+	}
+
+	var b strings.Builder
+	b.WriteString(styleTitle.Render(fmt.Sprintf("Project: %s", m.selectedProject.Name)))
+	b.WriteString("\n\n")
+
+	b.WriteString(styleInfo.Render(fmt.Sprintf("Path: %s", m.selectedProject.Path)))
+	b.WriteString("\n")
+	b.WriteString(styleInfo.Render(fmt.Sprintf("Compose File: %s", m.selectedProject.ComposeFile)))
+	b.WriteString("\n")
+	b.WriteString(styleInfo.Render(fmt.Sprintf("Status: %s", m.selectedProject.Status)))
+	b.WriteString("\n\n")
+
+	// Show containers/images
+	b.WriteString(styleHighlight.Render("📦 Containers & Images"))
+	b.WriteString("\n\n")
+
+	if len(m.selectedProject.ImageInfo) == 0 {
+		b.WriteString(styleMuted.Render("No image information available. Press 'r' in update screen to refresh."))
+		b.WriteString("\n")
+	} else {
+		for _, img := range m.selectedProject.ImageInfo {
+			// Extract image name
+			imgName := img.Name
+			if strings.Contains(imgName, "/") {
+				parts := strings.Split(imgName, "/")
+				imgName = parts[len(parts)-1]
+			}
+			// Remove tag from display name
+			if strings.Contains(imgName, ":") {
+				imgName = strings.Split(imgName, ":")[0]
+			}
+
+			// Show image with version
+			status := "✓"
+			statusStyle := styleSuccess
+			versionText := fmt.Sprintf("%s → %s", img.CurrentVersion, img.LatestVersion)
+
+			if img.HasUpdate {
+				status = "⬆"
+				statusStyle = styleHighlight
+			}
+
+			b.WriteString(statusStyle.Render(fmt.Sprintf("  %s ", status)))
+			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s ", imgName)))
+			b.WriteString(fmt.Sprintf("%s\n", versionText))
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(styleHelp.Render("Press Esc/q to go back, Enter to select action"))
 
 	return styleBox.Render(b.String())
 }
