@@ -240,62 +240,181 @@ func (p *Project) GetImages() ([]string, error) {
 	return images, nil
 }
 
-// getRealVersion attempts to get the actual version for images tagged as "latest" or similar
-func getRealVersion(imageName string, tagVersion string) string {
-	// If not a generic tag, return as-is
-	genericTags := []string{"latest", "stable", "edge", "main", "master"}
-	isGeneric := false
-	for _, tag := range genericTags {
-		if tagVersion == tag {
-			isGeneric = true
-			break
-		}
-	}
-	if !isGeneric {
+// parseVersionFromOutput extracts version information from command output
+func parseVersionFromOutput(output string, tagVersion string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) == 0 {
 		return tagVersion
 	}
 
-	// Try running container with --version flag first (with 5 second timeout)
-	// This is more reliable than labels as labels might show base OS version
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	// Look for version pattern in first few lines
+	for _, line := range lines[:min(5, len(lines))] {
+		line = strings.TrimSpace(line)
 
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", imageName, "--version")
-	output, err := cmd.Output()
-	if err == nil {
-		// Parse version from output (usually first line, first word that looks like a version)
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		if len(lines) > 0 {
-			// Look for version pattern in first few lines
-			for _, line := range lines[:min(3, len(lines))] {
-				// Match patterns like "Version: 18.7.1", "18.7.1", "v2.1.4", etc.
-				line = strings.TrimSpace(line)
-				if strings.Contains(strings.ToLower(line), "version:") {
-					parts := strings.SplitN(line, ":", 2)
-					if len(parts) == 2 {
-						version := strings.TrimSpace(parts[1])
-						if version != "" {
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+
+		// Match "Version: X.Y.Z", "version: X.Y.Z", "nginx version: X.Y.Z" patterns
+		lowerLine := strings.ToLower(line)
+		if strings.Contains(lowerLine, "version:") || strings.Contains(lowerLine, "version ") {
+			// Try to extract after "version:" or "version "
+			for _, sep := range []string{"version:", "version "} {
+				if idx := strings.Index(lowerLine, sep); idx >= 0 {
+					afterVersion := strings.TrimSpace(line[idx+len(sep):])
+					// Extract first word/field
+					fields := strings.Fields(afterVersion)
+					if len(fields) > 0 {
+						version := fields[0]
+						version = strings.TrimPrefix(version, "v")
+						version = strings.TrimPrefix(version, "V")
+						// Remove trailing punctuation
+						version = strings.TrimRight(version, ",;.")
+						if version != "" && version != tagVersion {
 							return version
 						}
 					}
 				}
-				// Try to extract version number directly
-				fields := strings.Fields(line)
-				for _, field := range fields {
-					field = strings.TrimPrefix(field, "v")
-					field = strings.TrimPrefix(field, "V")
-					// Check if it looks like a version (has digits and dots)
-					if strings.Contains(field, ".") && len(field) > 0 && (field[0] >= '0' && field[0] <= '9') {
-						return field
-					}
+			}
+		}
+
+		// Try to extract version number directly from any field
+		fields := strings.Fields(line)
+		for _, field := range fields {
+			field = strings.TrimPrefix(field, "v")
+			field = strings.TrimPrefix(field, "V")
+			// Remove trailing punctuation
+			field = strings.TrimRight(field, ",;.")
+			// Check if it looks like a version (has digits and dots)
+			if strings.Contains(field, ".") && len(field) > 0 && (field[0] >= '0' && field[0] <= '9') {
+				// Must have at least one digit before and after the dot
+				if parts := strings.Split(field, "."); len(parts) >= 2 {
+					return field
 				}
 			}
 		}
 	}
 
+	return tagVersion
+}
+
+// getRealVersion attempts to get the actual version for images tagged as "latest" or similar
+func getRealVersion(imageName string, tagVersion string) string {
+	// Check if tag is generic (exact match or starts with a generic prefix)
+	genericPrefixes := []string{"latest", "stable", "edge", "main", "master", "production", "nightly", "dev", "rc", "develop"}
+	isGeneric := false
+
+	// Check exact match first
+	for _, prefix := range genericPrefixes {
+		if tagVersion == prefix {
+			isGeneric = true
+			break
+		}
+	}
+
+	// Check if tag starts with generic prefix (e.g., "stable-alpine", "production-bookworm")
+	if !isGeneric {
+		for _, prefix := range genericPrefixes {
+			if strings.HasPrefix(tagVersion, prefix+"-") {
+				isGeneric = true
+				break
+			}
+		}
+	}
+
+	if !isGeneric {
+		return tagVersion
+	}
+
+	// Extract base image name (without registry/tag)
+	imageBaseName := imageName
+	if strings.Contains(imageBaseName, "/") {
+		parts := strings.Split(imageBaseName, "/")
+		imageBaseName = parts[len(parts)-1]
+	}
+	if strings.Contains(imageBaseName, ":") {
+		parts := strings.Split(imageBaseName, ":")
+		imageBaseName = parts[0]
+	}
+
+	// Try image-specific commands first (these are known to work for specific images)
+	type cmdConfig struct {
+		args       []string
+		entrypoint string // empty string means use default entrypoint
+	}
+
+	imageSpecificCommands := map[string][]cmdConfig{
+		"mosquitto": {
+			{args: []string{"mosquitto", "-h"}},
+		},
+		"eclipse-mosquitto": {
+			{args: []string{"mosquitto", "-h"}},
+		},
+		"nginx": {
+			{args: []string{"nginx", "-v"}},
+		},
+		"pure-ftpd": {
+			{args: []string{"pure-ftpd", "--help"}, entrypoint: ""},
+		},
+		"vsftpd": {
+			{args: []string{"vsftpd", "-v"}},
+		},
+	}
+
+	// Try image-specific commands if available
+	if cmds, ok := imageSpecificCommands[imageBaseName]; ok {
+		for _, cfg := range cmds {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+
+			var cmd *exec.Cmd
+			if cfg.entrypoint == "" {
+				// Use empty entrypoint
+				args := append([]string{"run", "--rm", "--entrypoint=", imageName}, cfg.args...)
+				cmd = exec.CommandContext(ctx, "docker", args...)
+			} else {
+				// Use default entrypoint
+				args := append([]string{"run", "--rm", imageName}, cfg.args...)
+				cmd = exec.CommandContext(ctx, "docker", args...)
+			}
+
+			output, err := cmd.CombinedOutput() // Use CombinedOutput to capture stderr too
+			cancel()
+
+			if err == nil && len(output) > 0 {
+				version := parseVersionFromOutput(string(output), tagVersion)
+				if version != tagVersion {
+					return version
+				}
+			}
+		}
+	}
+
+	// Try multiple standard version commands (different containers use different conventions)
+	versionCommands := [][]string{
+		{"--version"},
+		{"-v"},
+		{"-V"},
+		{"version"},
+	}
+
+	for _, cmdArgs := range versionCommands {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		cmd := exec.CommandContext(ctx, "docker", append([]string{"run", "--rm", imageName}, cmdArgs...)...)
+		output, err := cmd.Output()
+		cancel()
+
+		if err == nil && len(output) > 0 {
+			version := parseVersionFromOutput(string(output), tagVersion)
+			if version != tagVersion {
+				return version
+			}
+		}
+	}
+
 	// Fallback: Try to get version from image labels
-	cmd = exec.Command("docker", "image", "inspect", imageName, "--format", "{{json .Config.Labels}}")
-	output, err = cmd.Output()
+	cmd := exec.Command("docker", "image", "inspect", imageName, "--format", "{{json .Config.Labels}}")
+	output, err := cmd.Output()
 	if err == nil {
 		var labels map[string]string
 		if err := json.Unmarshal(output, &labels); err == nil {
@@ -402,7 +521,7 @@ func (p *Project) UpdateImageInfo() error {
 			// Image not pulled yet
 			p.ImageInfo[imageName] = ImageInfo{
 				Name:           imageName,
-				CurrentVersion: currentTag,
+				CurrentVersion: getRealVersion(imageName, currentTag),
 				LatestVersion:  "not pulled",
 				HasUpdate:      true,
 			}
@@ -429,7 +548,7 @@ func (p *Project) UpdateImageInfo() error {
 			// Timeout occurred
 			p.ImageInfo[imageName] = ImageInfo{
 				Name:           imageName,
-				CurrentVersion: currentTag,
+				CurrentVersion: getRealVersion(imageName, currentTag),
 				LatestVersion:  "timeout",
 				HasUpdate:      false,
 			}
@@ -438,18 +557,18 @@ func (p *Project) UpdateImageInfo() error {
 
 		hasUpdate := currentID != latestID && latestID != ""
 
-		// Always show tag names, not IDs
-		// For "latest" or "stable" tags, we show the tag even if there's an update
-		latestVersion := currentTag
+		// Get real versions for generic tags (latest, stable, etc.)
+		currentVersion := getRealVersion(imageName, currentTag)
+		latestVersion := currentVersion
+
 		if hasUpdate {
-			// For versioned tags like "1.2.3", show "newer available"
-			// For latest/stable, just indicate update
-			latestVersion = currentTag + " (newer)"
+			// Try to get real version of the newly pulled (latest) image
+			latestVersion = getRealVersion(imageName, currentTag)
 		}
 
 		p.ImageInfo[imageName] = ImageInfo{
 			Name:           imageName,
-			CurrentVersion: currentTag,
+			CurrentVersion: currentVersion,
 			LatestVersion:  latestVersion,
 			HasUpdate:      hasUpdate,
 		}

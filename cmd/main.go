@@ -172,7 +172,7 @@ func main() {
 	}
 
 	// Create and run the TUI
-	model := ui.NewModel(projects)
+	model := ui.NewModel(projects, cacheFile)
 	p := tea.NewProgram(model, tea.WithAltScreen())
 
 	if _, err := p.Run(); err != nil {

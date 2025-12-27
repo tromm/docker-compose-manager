@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbletea"
@@ -46,10 +47,34 @@ type Model struct {
 	cacheAge          string // How old is the cache
 	checkingUpdates   bool   // Currently checking for updates
 	currentCheckIndex int    // Index of project currently being checked (-1 if none)
+	cacheFile         string // Path to cache file for saving
+}
+
+// truncateMiddle truncates a string in the middle if it exceeds maxLen
+// Keeps the last 3 characters visible with "..." in the middle
+// Example: "super-lange-bookworm-version-mit-krass-vielen-zeichen" (maxLen=30)
+//       -> "super-lange-bookworm-ver...hen"
+func truncateMiddle(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+
+	// Keep last 3 chars
+	if maxLen < 6 {
+		// If maxLen is too small, just truncate normally
+		return s[:maxLen]
+	}
+
+	suffix := s[len(s)-3:]
+	// Calculate prefix length: maxLen - 3 (dots) - 3 (suffix)
+	prefixLen := maxLen - 3 - 3
+	prefix := s[:prefixLen]
+
+	return prefix + "..." + suffix
 }
 
 // NewModel creates a new UI model
-func NewModel(projects []*docker.Project) Model {
+func NewModel(projects []*docker.Project, cacheFile string) Model {
 	return Model{
 		projects:          projects,
 		screen:            ScreenMainMenu,
@@ -57,6 +82,7 @@ func NewModel(projects []*docker.Project) Model {
 		selectedUpdates:   make(map[int]bool),
 		selectedRestarts:  make(map[int]bool),
 		currentCheckIndex: -1,
+		cacheFile:         cacheFile,
 	}
 }
 
@@ -94,7 +120,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a", "A":
 			return m.handleSelectAll()
 
-		case "r", "R":
+		case "u", "U":
 			return m.handleRefresh()
 
 		case "1", "2", "3":
@@ -124,9 +150,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCompleteMsg:
 		m.updatesCompleted++
 		if msg.success {
-			m.updateProgress += fmt.Sprintf("✓ %s updated successfully (%d/%d)\n", msg.projectName, m.updatesCompleted, m.updatesTotal)
+			successMsg := fmt.Sprintf("  ✓ %-20s updated successfully (%d/%d)\n", msg.projectName, m.updatesCompleted, m.updatesTotal)
+			m.updateProgress += successMsg
 		} else {
-			m.updateProgress += styleError.Render(fmt.Sprintf("✗ %s failed: %v (%d/%d)\n", msg.projectName, msg.err, m.updatesCompleted, m.updatesTotal))
+			errorMsg := fmt.Sprintf("  ✗ %-20s failed: %v (%d/%d)\n", msg.projectName, msg.err, m.updatesCompleted, m.updatesTotal)
+			m.updateProgress += styleError.Render(errorMsg)
 		}
 
 		// Check if all updates are done
@@ -145,6 +173,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.checkingUpdates = false
 		m.currentCheckIndex = -1
 		m.cacheAge = m.calculateCacheAge()
+		// Save updated cache to disk
+		if err := docker.SaveToCache(m.projects, m.cacheFile); err != nil {
+			m.message = fmt.Sprintf("Warning: failed to save cache: %v", err)
+		}
 		return m, nil
 
 	case projectCheckProgressMsg:
@@ -738,7 +770,7 @@ func (m Model) viewUpdateList() string {
 	b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s  ", "Lokal")))
 	b.WriteString(styleHighlight.Render("Repository"))
 	b.WriteString("\n")
-	b.WriteString(styleMuted.Render("  ─ ──── ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
+	b.WriteString(styleMuted.Render("  ──── ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
 	b.WriteString("\n")
 
 	for i, project := range m.projects {
@@ -768,10 +800,10 @@ func (m Model) viewUpdateList() string {
 		if len(project.ImageInfo) == 0 {
 			// No image info - show project name only with message to refresh
 			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
-			b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
-			b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s", project.Name)))
+			b.WriteString(cursorStyle.Render(fmt.Sprintf("%-4s ", checkbox)))
+			b.WriteString(nameStyle.Render(fmt.Sprintf("%-20s  ", project.Name)))
 			b.WriteString(spinner)
-			b.WriteString(styleMuted.Render("  (press 'r' to load versions)"))
+			b.WriteString(styleMuted.Render("(press 'u' to update cache)"))
 			b.WriteString("\n")
 		} else {
 			// Check if project has any updates
@@ -783,10 +815,18 @@ func (m Model) viewUpdateList() string {
 				}
 			}
 
+			// Sort image names for consistent display order
+			imageNames := make([]string, 0, len(project.ImageInfo))
+			for imgName := range project.ImageInfo {
+				imageNames = append(imageNames, imgName)
+			}
+			sort.Strings(imageNames)
+
 			// Show first image on same line as project name
 			firstImg := true
 			imgCount := 0
-			for _, img := range project.ImageInfo {
+			for _, imgKey := range imageNames {
+				img := project.ImageInfo[imgKey]
 				// Extract image name and tag
 				imgName := img.Name
 				imgTag := "latest"
@@ -809,17 +849,19 @@ func (m Model) viewUpdateList() string {
 						updateIndicator = "⬆ "
 					}
 					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", cursor)))
-					b.WriteString(cursorStyle.Render(fmt.Sprintf("%s ", checkbox)))
-					b.WriteString(nameStyle.Render(fmt.Sprintf("%-18s%s", project.Name, updateIndicator)))
+					b.WriteString(cursorStyle.Render(fmt.Sprintf("%-4s ", checkbox)))
+					b.WriteString(nameStyle.Render(fmt.Sprintf("%-18s%s  ", project.Name, updateIndicator)))
 					firstImg = false
 				} else {
-					// Additional images: indent
-					b.WriteString(fmt.Sprintf("  %s %-20s", "   ", ""))
+					// Additional images: indent (match header column widths: 2 cursor + 5 checkbox + 22 project = 29)
+					b.WriteString("  ")      // 2 chars for cursor column
+					b.WriteString("     ")   // 5 chars for checkbox column
+					b.WriteString("                      ")  // 22 chars for project column
 				}
 
 				// Version info with color coding
-				localVersion := img.CurrentVersion
-				repoVersion := img.LatestVersion
+				localVersion := truncateMiddle(img.CurrentVersion, 15)
+				repoVersion := truncateMiddle(img.LatestVersion, 15)
 				versionStyle := lipgloss.NewStyle()
 
 				if img.HasUpdate {
@@ -828,8 +870,8 @@ func (m Model) viewUpdateList() string {
 					versionStyle = styleMuted
 				}
 
-				b.WriteString(versionStyle.Render(fmt.Sprintf("%-20s  ", imgName)))
-				b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", imgTag)))
+				b.WriteString(versionStyle.Render(fmt.Sprintf("%-20s  ", truncateMiddle(imgName, 20))))
+				b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", truncateMiddle(imgTag, 12))))
 				b.WriteString(fmt.Sprintf("%-15s  ", localVersion))
 				b.WriteString(versionStyle.Render(repoVersion))
 
@@ -842,7 +884,7 @@ func (m Model) viewUpdateList() string {
 
 			// Add separator line after each project (except last)
 			if i < len(m.projects)-1 {
-				b.WriteString(styleMuted.Render("  ┄ ──── ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
+				b.WriteString(styleMuted.Render("  ┄┄┄┄ ────────────────────  ────────────────────  ────────────  ───────────────  ──────────────"))
 				b.WriteString("\n")
 			}
 		}
@@ -854,7 +896,7 @@ func (m Model) viewUpdateList() string {
 		b.WriteString(styleInfo.Render(fmt.Sprintf("Selected: %d project(s)", selectedCount)))
 		b.WriteString("\n")
 	}
-	b.WriteString(styleHelp.Render("Space to select, 'a' select all, 'r' refresh, Enter to continue, Esc/q to go back"))
+	b.WriteString(styleHelp.Render("Space to select, 'a' select all, 'u' update cache, Enter to continue, Esc/q to go back"))
 
 	return styleBox.Render(b.String())
 }
@@ -1077,7 +1119,15 @@ func (m Model) viewContainerDetail() string {
 		b.WriteString(styleMuted.Render("  ──────  ────────────────────  ────────────  ───────────────  ──────────────"))
 		b.WriteString("\n")
 
-		for _, img := range m.selectedProject.ImageInfo {
+		// Sort image names for consistent display order
+		imageNames := make([]string, 0, len(m.selectedProject.ImageInfo))
+		for imgName := range m.selectedProject.ImageInfo {
+			imageNames = append(imageNames, imgName)
+		}
+		sort.Strings(imageNames)
+
+		for _, imgKey := range imageNames {
+			img := m.selectedProject.ImageInfo[imgKey]
 			// Extract image name and tag
 			imgName := img.Name
 			imgTag := "latest"
@@ -1104,10 +1154,10 @@ func (m Model) viewContainerDetail() string {
 			}
 
 			b.WriteString(statusStyle.Render(fmt.Sprintf("  %-6s  ", status)))
-			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s  ", imgName)))
-			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", imgTag)))
-			b.WriteString(fmt.Sprintf("%-15s  ", img.CurrentVersion))
-			b.WriteString(fmt.Sprintf("%s\n", img.LatestVersion))
+			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s  ", truncateMiddle(imgName, 20))))
+			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", truncateMiddle(imgTag, 12))))
+			b.WriteString(fmt.Sprintf("%-15s  ", truncateMiddle(img.CurrentVersion, 15)))
+			b.WriteString(fmt.Sprintf("%s\n", truncateMiddle(img.LatestVersion, 15)))
 		}
 	}
 
