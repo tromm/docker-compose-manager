@@ -240,6 +240,91 @@ func (p *Project) GetImages() ([]string, error) {
 	return images, nil
 }
 
+// getRealVersion attempts to get the actual version for images tagged as "latest" or similar
+func getRealVersion(imageName string, tagVersion string) string {
+	// If not a generic tag, return as-is
+	genericTags := []string{"latest", "stable", "edge", "main", "master"}
+	isGeneric := false
+	for _, tag := range genericTags {
+		if tagVersion == tag {
+			isGeneric = true
+			break
+		}
+	}
+	if !isGeneric {
+		return tagVersion
+	}
+
+	// Try running container with --version flag first (with 5 second timeout)
+	// This is more reliable than labels as labels might show base OS version
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", imageName, "--version")
+	output, err := cmd.Output()
+	if err == nil {
+		// Parse version from output (usually first line, first word that looks like a version)
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		if len(lines) > 0 {
+			// Look for version pattern in first few lines
+			for _, line := range lines[:min(3, len(lines))] {
+				// Match patterns like "Version: 18.7.1", "18.7.1", "v2.1.4", etc.
+				line = strings.TrimSpace(line)
+				if strings.Contains(strings.ToLower(line), "version:") {
+					parts := strings.SplitN(line, ":", 2)
+					if len(parts) == 2 {
+						version := strings.TrimSpace(parts[1])
+						if version != "" {
+							return version
+						}
+					}
+				}
+				// Try to extract version number directly
+				fields := strings.Fields(line)
+				for _, field := range fields {
+					field = strings.TrimPrefix(field, "v")
+					field = strings.TrimPrefix(field, "V")
+					// Check if it looks like a version (has digits and dots)
+					if strings.Contains(field, ".") && len(field) > 0 && (field[0] >= '0' && field[0] <= '9') {
+						return field
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback: Try to get version from image labels
+	cmd = exec.Command("docker", "image", "inspect", imageName, "--format", "{{json .Config.Labels}}")
+	output, err = cmd.Output()
+	if err == nil {
+		var labels map[string]string
+		if err := json.Unmarshal(output, &labels); err == nil {
+			// Check standard OCI labels
+			if version, ok := labels["org.opencontainers.image.version"]; ok && version != "" && version != tagVersion {
+				return version
+			}
+			// Check common custom labels
+			if version, ok := labels["version"]; ok && version != "" {
+				return version
+			}
+			if version, ok := labels["VERSION"]; ok && version != "" {
+				return version
+			}
+		}
+	}
+
+	// If all else fails, return the tag as-is
+	return tagVersion
+}
+
+// min helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // GetRunningContainerInfo gets version info from currently running containers
 // This is used for display purposes when ImageInfo cache is not available
 func (p *Project) GetRunningContainerInfo() error {
@@ -265,11 +350,14 @@ func (p *Project) GetRunningContainerInfo() error {
 		}
 
 		// Extract version tag from image name
-		currentVersion := "latest"
+		tagVersion := "latest"
 		if strings.Contains(imageName, ":") {
 			parts := strings.Split(imageName, ":")
-			currentVersion = parts[len(parts)-1]
+			tagVersion = parts[len(parts)-1]
 		}
+
+		// Try to get real version for generic tags
+		currentVersion := getRealVersion(imageName, tagVersion)
 
 		// Store in ImageInfo (without checking for updates)
 		p.ImageInfo[imageName] = ImageInfo{
