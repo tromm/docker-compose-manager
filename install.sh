@@ -1,10 +1,10 @@
 #!/bin/bash
 # Docker Compose Manager - Install Script
-# Usage: curl -sSL https://raw.githubusercontent.com/USER/docker-compose-manager/main/install.sh | sudo bash
+# Usage: curl -sSL https://raw.githubusercontent.com/tromm/docker-compose-manager/main/install.sh | sudo bash
 
 set -e
 
-REPO="USER/docker-compose-manager"  # Replace with your GitHub username
+REPO="tromm/docker-compose-manager"
 INSTALL_DIR="/usr/local/bin"
 CACHE_DIR="/var/cache/docker-compose-manager"
 BINARY_NAME="docker-compose-manager"

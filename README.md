@@ -30,7 +30,7 @@ A modern, terminal-based UI for managing Docker Compose projects. Built with Go 
 Install the latest release with a single command:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/docker-compose-manager/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/tromm/docker-compose-manager/main/install.sh | sudo bash
 ```
 
 This will:
@@ -46,11 +46,11 @@ This will:
 
 #### Option 2: Manual Download
 
-Download the binary for your platform from the [Releases](https://github.com/YOUR_USERNAME/docker-compose-manager/releases) page:
+Download the binary for your platform from the [Releases](https://github.com/tromm/docker-compose-manager/releases) page:
 
 ```bash
 # Example for Linux AMD64
-curl -LO https://github.com/YOUR_USERNAME/docker-compose-manager/releases/latest/download/docker-compose-manager-linux-amd64
+curl -LO https://github.com/tromm/docker-compose-manager/releases/latest/download/docker-compose-manager-linux-amd64
 chmod +x docker-compose-manager-linux-amd64
 sudo mv docker-compose-manager-linux-amd64 /usr/local/bin/docker-compose-manager
 ```
@@ -59,7 +59,7 @@ sudo mv docker-compose-manager-linux-amd64 /usr/local/bin/docker-compose-manager
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/docker-compose-manager.git
+git clone https://github.com/tromm/docker-compose-manager.git
 cd docker-compose-manager
 
 # Build
@@ -299,7 +299,7 @@ GitHub Actions will automatically:
 
 Users can then install via:
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/docker-compose-manager/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/tromm/docker-compose-manager/main/install.sh | sudo bash
 ```
 
 ## Roadmap
