@@ -998,6 +998,11 @@ func (m Model) viewContainerDetail() string {
 		return styleError.Render("No project selected")
 	}
 
+	// If ImageInfo is empty, try to get running container info
+	if len(m.selectedProject.ImageInfo) == 0 {
+		m.selectedProject.GetRunningContainerInfo()
+	}
+
 	var b strings.Builder
 	b.WriteString(styleTitle.Render(fmt.Sprintf("Project: %s", m.selectedProject.Name)))
 	b.WriteString("\n\n")
@@ -1014,7 +1019,7 @@ func (m Model) viewContainerDetail() string {
 	b.WriteString("\n\n")
 
 	if len(m.selectedProject.ImageInfo) == 0 {
-		b.WriteString(styleMuted.Render("No image information available. Press 'r' in update screen to refresh."))
+		b.WriteString(styleMuted.Render("No containers running or unable to fetch container information."))
 		b.WriteString("\n")
 	} else {
 		for _, img := range m.selectedProject.ImageInfo {

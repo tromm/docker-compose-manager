@@ -240,6 +240,49 @@ func (p *Project) GetImages() ([]string, error) {
 	return images, nil
 }
 
+// GetRunningContainerInfo gets version info from currently running containers
+// This is used for display purposes when ImageInfo cache is not available
+func (p *Project) GetRunningContainerInfo() error {
+	if p.ImageInfo == nil {
+		p.ImageInfo = make(map[string]ImageInfo)
+	}
+
+	// Get running containers for this project using docker ps
+	// Format: container_name, image
+	cmd := exec.Command("docker", "ps", "--filter", fmt.Sprintf("label=com.docker.compose.project=%s", p.Name), "--format", "{{.Image}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+
+	// Process each image
+	for _, imageName := range lines {
+		imageName = strings.TrimSpace(imageName)
+		if imageName == "" {
+			continue
+		}
+
+		// Extract version tag from image name
+		currentVersion := "latest"
+		if strings.Contains(imageName, ":") {
+			parts := strings.Split(imageName, ":")
+			currentVersion = parts[len(parts)-1]
+		}
+
+		// Store in ImageInfo (without checking for updates)
+		p.ImageInfo[imageName] = ImageInfo{
+			Name:           imageName,
+			CurrentVersion: currentVersion,
+			LatestVersion:  currentVersion, // Same as current since we're not checking
+			HasUpdate:      false,
+		}
+	}
+
+	return nil
+}
+
 // UpdateImageInfo updates the image version information for this project
 func (p *Project) UpdateImageInfo() error {
 	if p.ImageInfo == nil {
