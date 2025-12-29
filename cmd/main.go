@@ -59,6 +59,7 @@ func main() {
 	// Check for flags
 	listMode := false
 	updateCacheMode := false
+	debugMode := false
 	searchDir := defaultSearchDir
 
 	for i := 1; i < len(os.Args); i++ {
@@ -67,6 +68,8 @@ func main() {
 			listMode = true
 		} else if arg == "--update-cache" {
 			updateCacheMode = true
+		} else if arg == "--debug" || arg == "-d" {
+			debugMode = true
 		} else if arg == "--help" || arg == "-h" {
 			fmt.Println("Docker Compose Manager")
 			fmt.Println("\nUsage:")
@@ -74,11 +77,13 @@ func main() {
 			fmt.Println("\nOptions:")
 			fmt.Println("  -l, --list         List all projects and their status (non-interactive)")
 			fmt.Println("  --update-cache     Update cache with latest image versions (for cron)")
+			fmt.Println("  -d, --debug        Enable debug logging to ~/docker-compose-manager-debug.log")
 			fmt.Println("  -h, --help         Show this help message")
 			fmt.Println("\nExamples:")
 			fmt.Println("  docker-compose-manager")
 			fmt.Println("  docker-compose-manager /path/to/docker")
 			fmt.Println("  docker-compose-manager --list")
+			fmt.Println("  docker-compose-manager --debug")
 			fmt.Println("  docker-compose-manager --update-cache  # For cron job")
 			os.Exit(0)
 		} else {
@@ -172,8 +177,22 @@ func main() {
 	}
 
 	// Create and run the TUI
-	model := ui.NewModel(projects, cacheFile)
-	p := tea.NewProgram(model, tea.WithAltScreen())
+	if debugMode {
+		homeDir, _ := os.UserHomeDir()
+		logFile := filepath.Join(homeDir, "docker-compose-manager-debug.log")
+		fmt.Printf("🐛 Debug mode enabled - logging to: %s\n", logFile)
+		time.Sleep(1 * time.Second)
+	}
+
+	model := ui.NewModel(projects, cacheFile, debugMode)
+
+	// Use inline mode instead of alt screen to avoid diff-rendering artifacts
+	// This forces a full redraw on every update
+	p := tea.NewProgram(
+		model,
+		// REMOVED: tea.WithAltScreen() - causes rendering artifacts
+		tea.WithMouseCellMotion(),
+	)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)

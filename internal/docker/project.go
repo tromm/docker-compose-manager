@@ -590,13 +590,17 @@ func (p *Project) CheckForUpdates() (bool, error) {
 // PullOnly pulls latest images without restarting containers
 func (p *Project) PullOnly() error {
 	// Pull latest images
-	cmd := exec.Command("docker", "compose", "pull")
+	cmd := exec.Command("docker", "compose", "pull", "--quiet")
 	cmd.Dir = p.Path
+	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Try docker-compose (v1)
-		cmd = exec.Command("docker-compose", "pull")
+		cmd = exec.Command("docker-compose", "pull", "--quiet")
 		cmd.Dir = p.Path
+		cmd.Stdin = nil
+		cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0")
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			return cleanDockerError("pull", output, err)
@@ -610,13 +614,17 @@ func (p *Project) PullOnly() error {
 // Update performs a pull and recreate for this project
 func (p *Project) Update() error {
 	// Pull latest images
-	cmd := exec.Command("docker", "compose", "pull")
+	cmd := exec.Command("docker", "compose", "pull", "--quiet")
 	cmd.Dir = p.Path
+	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// Try docker-compose (v1)
-		cmd = exec.Command("docker-compose", "pull")
+		cmd = exec.Command("docker-compose", "pull", "--quiet")
 		cmd.Dir = p.Path
+		cmd.Stdin = nil
+		cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0")
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			return cleanDockerError("pull", output, err)
@@ -626,16 +634,22 @@ func (p *Project) Update() error {
 	// Remove orphaned containers first (prevents KeyError: 'ContainerConfig')
 	cmd = exec.Command("docker", "compose", "down", "--remove-orphans")
 	cmd.Dir = p.Path
+	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never")
 	cmd.Run() // Ignore errors, this is cleanup
 
 	// Recreate containers with new images
 	cmd = exec.Command("docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans")
 	cmd.Dir = p.Path
+	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err = cmd.CombinedOutput()
 	if err != nil {
 		// Try docker-compose (v1)
 		cmd = exec.Command("docker-compose", "up", "-d", "--force-recreate", "--remove-orphans")
 		cmd.Dir = p.Path
+		cmd.Stdin = nil
+		cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0")
 		output, err = cmd.CombinedOutput()
 		if err != nil {
 			return cleanDockerError("recreate", output, err)
