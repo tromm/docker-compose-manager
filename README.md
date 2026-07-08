@@ -88,31 +88,54 @@ make install
 ./docker-compose-manager --update-cache
 ```
 
+### How Updates Are Detected (lightweight, no pull)
+
+The update check is **pull-free**. For each image it compares the *local image
+config digest* (`docker image inspect --format '{{.Id}}'`) with the *registry's
+config digest* obtained via `docker manifest inspect` — matched to the host
+platform. If they differ, an update is available. Nothing is downloaded and no
+container is started, so the check is fast and safe to run from cron.
+
+Image states shown in the UI:
+- `update` — a newer image exists in the registry
+- `not-pulled` — the image is referenced but not present locally
+- `unknown` — the registry could not be queried (offline, auth required, or a
+  locally-built image) — deliberately **not** flagged as an update
+- `ok` — up to date
+
 ### Cron Job for Automatic Update Checks
 
-To automatically check for updates in the background, add this to your crontab:
+The cache is kept fresh by a cron job. `make install` prints the exact line; it
+looks like this (note the explicit `--cache`, which guarantees cron and the TUI
+use the **same** file, and logging instead of `>/dev/null`):
 
 ```bash
-# Check for updates every 6 hours
-0 */6 * * * /path/to/docker-compose-manager --update-cache
-
-# Or check daily at 2 AM
-0 2 * * * /path/to/docker-compose-manager --update-cache
+# Refresh available updates every 6 hours (run as the user that owns the cache)
+0 */6 * * * /usr/local/bin/docker-compose-manager --update-cache \
+    --cache /var/cache/docker-compose-manager/cache.json \
+    /home/dockeruser/docker/ >> $HOME/.cache/dcm-cron.log 2>&1
 ```
 
 The `--update-cache` mode:
-- Runs with live progress display (perfect for cron jobs)
-- Checks all images for available updates (2-minute timeout per image)
-- Saves results incrementally to cache file after each project
-- Next time you run the TUI, it will use cached update data
+- Refreshes the cache with available updates using the pull-free digest check
+- Saves results incrementally after each project
+- Makes the update counts appear instantly on the next TUI start
 
 ### Cache Location
 
-The cache is stored in:
-- **System-wide**: `/var/cache/docker-compose-manager/cache.json` (preferred, requires write permissions)
-- **User-specific**: `~/.cache/docker-compose-manager/cache.json` (fallback if system cache not writable)
+Resolved deterministically (highest precedence first):
+1. `--cache PATH` flag
+2. `$DCM_CACHE` environment variable
+3. `/var/cache/docker-compose-manager/cache.json` (if writable by the current user)
+4. `~/.cache/docker-compose-manager/cache.json` (fallback)
 
-For system-wide installation with cron jobs, ensure the cache directory has proper permissions:
+> **Important:** cron and the interactive TUI must resolve to the **same** file.
+> Historically this broke because a root cron wrote `/var/cache` while the user
+> read `~/.cache` (split-brain), and the cron pointed at a non-existent binary
+> path. `make install` fixes this by installing to `/usr/local/bin`, chowning
+> the cache dir to the running user, and printing a cron line with explicit
+> `--cache`.
+
 ```bash
 sudo mkdir -p /var/cache/docker-compose-manager
 sudo chown $USER:$USER /var/cache/docker-compose-manager
@@ -121,12 +144,18 @@ sudo chown $USER:$USER /var/cache/docker-compose-manager
 ## Navigation
 
 - **↑/↓ or k/j** - Navigate menu items
-- **Space** - Toggle selection (in update list)
-- **a** - Select all / Deselect all (in update list)
-- **r** - Refresh update check (in update list)
+- **Space or 1-9/0** - Toggle selection (in update list)
+- **a** - Select / deselect all visible projects (in update list)
+- **o** - Select only projects that have updates (in update list)
+- **f** - Filter: show only projects with updates (in update list)
+- **u** - Refresh update check (in update list)
 - **Enter** - Select item / Confirm
 - **Esc or q** - Go back / Exit (with confirmation in main menu)
 - **Ctrl+C** - Force quit
+
+The lists are **responsive** (k9s-style): one row per project, a coloured status
+glyph (⬆ update · ✓ ok · ○ stopped · ? unchecked), and columns that drop by
+priority on narrow terminals so important information is never lost.
 
 ## Menu Structure
 
@@ -149,11 +178,11 @@ Main Menu
 
 ## Performance
 
-The cache system stores project metadata in `~/.docker-compose-manager-cache.json`:
+The cache stores project metadata and update state (see [Cache Location](#cache-location)):
 
 - **First run**: Scans all projects (~2-5 seconds for 30+ projects)
-- **Cached runs**: Instant startup (< 100ms)
-- **Cache lifetime**: 1 hour (configurable)
+- **Cached runs**: Instant startup (< 100ms) — update counts show immediately on the main menu
+- **Cache lifetime**: 24 hours (`cacheMaxAge` in `cmd/main.go`); refreshed by the cron job
 
 ## Building for Different Platforms
 
@@ -244,7 +273,7 @@ Default values can be changed in `cmd/main.go`:
 const (
     defaultSearchDir = "/home/dockeruser/docker"  // Default search directory
     defaultMaxDepth  = 10                          // Max recursion depth
-    cacheMaxAge      = 1 * time.Hour              // Cache lifetime
+    cacheMaxAge      = 24 * time.Hour             // Cache lifetime
 )
 ```
 
@@ -260,7 +289,7 @@ const (
 - Log out and back in for group changes to take effect
 
 ### Cache issues
-- Delete cache file: `rm ~/.docker-compose-manager-cache.json`
+- Delete cache file: `rm /var/cache/docker-compose-manager/cache.json` (or `~/.cache/docker-compose-manager/cache.json`)
 - Cache auto-refreshes after 1 hour
 
 ## License
@@ -313,7 +342,8 @@ curl -sSL https://raw.githubusercontent.com/tromm/docker-compose-manager/main/in
 - [ ] Container restart policies management
 - [ ] Export/import configuration
 - [ ] Multi-project operations (start/stop all)
-- [ ] Search/filter projects
+- [✓] Filter projects with updates (update screen: 'f' / 'o') - **DONE**
+- [ ] Full-text search across projects
 
 ## Credits
 

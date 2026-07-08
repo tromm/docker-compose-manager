@@ -1,35 +1,87 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
+// isRateLimited reports whether a docker error message indicates the registry
+// throttled the request (Docker Hub anonymous pull/manifest limits).
+func isRateLimited(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "toomanyrequests") ||
+		strings.Contains(m, "429") ||
+		strings.Contains(m, "rate limit")
+}
+
 // ImageInfo stores version information for an image
 type ImageInfo struct {
 	Name           string `json:"name"`
-	CurrentVersion string `json:"current_version"` // Current local image ID
-	LatestVersion  string `json:"latest_version"`  // Latest available image ID
+	CurrentVersion string `json:"current_version"` // Human-readable current version (tag or label)
+	LatestVersion  string `json:"latest_version"`  // Human-readable latest version (best effort)
 	HasUpdate      bool   `json:"has_update"`
+	State          string `json:"state,omitempty"` // "ok" | "update" | "not-pulled" | "local" | "unknown"
 }
 
 // Project represents a Docker Compose project
 type Project struct {
-	Name              string                `json:"name"`
-	Path              string                `json:"path"`
-	ComposeFile       string                `json:"compose_file"`
-	Status            string                `json:"status"`           // "stopped" or "running:N"
-	RunningContainers int                   `json:"running_containers"`
-	Images            []string              `json:"images"`
-	ImageInfo         map[string]ImageInfo  `json:"image_info"` // Map of image name to version info
-	HasUpdates        bool                  `json:"has_updates"`
-	LastUpdated       time.Time             `json:"last_updated"`
+	Name              string               `json:"name"`
+	Path              string               `json:"path"`
+	ComposeFile       string               `json:"compose_file"`
+	Status            string               `json:"status"` // "stopped" or "running:N"
+	RunningContainers int                  `json:"running_containers"`
+	TotalServices     int                  `json:"total_services"` // Number of services defined in compose file
+	Images            []string             `json:"images"`
+	ImageInfo         map[string]ImageInfo `json:"image_info"` // Map of image name to version info
+	HasUpdates        bool                 `json:"has_updates"`
+	LastUpdated       time.Time            `json:"last_updated"`
+}
+
+// UpdateCount returns how many images in this project have an update available.
+func (p *Project) UpdateCount() int {
+	n := 0
+	for _, img := range p.ImageInfo {
+		if img.HasUpdate {
+			n++
+		}
+	}
+	return n
+}
+
+// ImageCount returns how many images this project has version info for.
+func (p *Project) ImageCount() int {
+	return len(p.ImageInfo)
+}
+
+// UnknownCount returns how many images could not be checked against the registry.
+func (p *Project) UnknownCount() int {
+	n := 0
+	for _, img := range p.ImageInfo {
+		if img.State == "unknown" {
+			n++
+		}
+	}
+	return n
+}
+
+// FullyUnknown reports that the project has images but none could be verified
+// (all unreachable) and none have a known update — so it must not be shown as
+// "up to date".
+func (p *Project) FullyUnknown() bool {
+	return len(p.ImageInfo) > 0 && p.UpdateCount() == 0 && p.UnknownCount() == len(p.ImageInfo)
+}
+
+// Checked reports whether update information has been gathered for this project.
+func (p *Project) Checked() bool {
+	return len(p.ImageInfo) > 0
 }
 
 // IsRunning checks if the project has running containers
@@ -151,7 +203,32 @@ func (p *Project) UpdateStatus() error {
 		p.Status = "stopped"
 	}
 
+	p.TotalServices = p.countServices()
+
 	return nil
+}
+
+// countServices returns the number of services defined in the compose file.
+// Best effort: returns 0 if it cannot be determined.
+func (p *Project) countServices() int {
+	cmd := exec.Command("docker", "compose", "config", "--services")
+	cmd.Dir = p.Path
+	output, err := cmd.Output()
+	if err != nil {
+		cmd = exec.Command("docker-compose", "config", "--services")
+		cmd.Dir = p.Path
+		output, err = cmd.Output()
+		if err != nil {
+			return 0
+		}
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
 }
 
 // Start starts the containers
@@ -240,208 +317,157 @@ func (p *Project) GetImages() ([]string, error) {
 	return images, nil
 }
 
-// parseVersionFromOutput extracts version information from command output
-func parseVersionFromOutput(output string, tagVersion string) string {
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) == 0 {
+// genericTag reports whether a tag is a rolling/generic tag (latest, stable, …)
+// rather than a concrete version, in which case we try to resolve a real version
+// from image labels.
+func genericTag(tag string) bool {
+	genericPrefixes := []string{"latest", "stable", "edge", "main", "master", "production", "nightly", "dev", "rc", "develop", "release"}
+	for _, prefix := range genericPrefixes {
+		if tag == prefix || strings.HasPrefix(tag, prefix+"-") {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveVersion returns a human-readable version string for an image.
+// Lightweight: uses the tag directly for concrete tags, and falls back to
+// locally available image labels for generic tags. It never starts a container.
+func resolveVersion(imageName string, tagVersion string) string {
+	if !genericTag(tagVersion) {
 		return tagVersion
 	}
 
-	// Look for version pattern in first few lines
-	for _, line := range lines[:min(5, len(lines))] {
-		line = strings.TrimSpace(line)
-
-		// Skip empty lines
-		if line == "" {
-			continue
-		}
-
-		// Match "Version: X.Y.Z", "version: X.Y.Z", "nginx version: X.Y.Z" patterns
-		lowerLine := strings.ToLower(line)
-		if strings.Contains(lowerLine, "version:") || strings.Contains(lowerLine, "version ") {
-			// Try to extract after "version:" or "version "
-			for _, sep := range []string{"version:", "version "} {
-				if idx := strings.Index(lowerLine, sep); idx >= 0 {
-					afterVersion := strings.TrimSpace(line[idx+len(sep):])
-					// Extract first word/field
-					fields := strings.Fields(afterVersion)
-					if len(fields) > 0 {
-						version := fields[0]
-						version = strings.TrimPrefix(version, "v")
-						version = strings.TrimPrefix(version, "V")
-						// Remove trailing punctuation
-						version = strings.TrimRight(version, ",;.")
-						if version != "" && version != tagVersion {
-							return version
-						}
-					}
-				}
-			}
-		}
-
-		// Try to extract version number directly from any field
-		fields := strings.Fields(line)
-		for _, field := range fields {
-			field = strings.TrimPrefix(field, "v")
-			field = strings.TrimPrefix(field, "V")
-			// Remove trailing punctuation
-			field = strings.TrimRight(field, ",;.")
-			// Check if it looks like a version (has digits and dots)
-			if strings.Contains(field, ".") && len(field) > 0 && (field[0] >= '0' && field[0] <= '9') {
-				// Must have at least one digit before and after the dot
-				if parts := strings.Split(field, "."); len(parts) >= 2 {
-					return field
-				}
-			}
-		}
+	// Generic tag: try to read a real version from the local image's labels.
+	if v := versionFromLabels(imageName); v != "" {
+		return v
 	}
-
 	return tagVersion
 }
 
-// getRealVersion attempts to get the actual version for images tagged as "latest" or similar
-func getRealVersion(imageName string, tagVersion string) string {
-	// Check if tag is generic (exact match or starts with a generic prefix)
-	genericPrefixes := []string{"latest", "stable", "edge", "main", "master", "production", "nightly", "dev", "rc", "develop"}
-	isGeneric := false
-
-	// Check exact match first
-	for _, prefix := range genericPrefixes {
-		if tagVersion == prefix {
-			isGeneric = true
-			break
-		}
-	}
-
-	// Check if tag starts with generic prefix (e.g., "stable-alpine", "production-bookworm")
-	if !isGeneric {
-		for _, prefix := range genericPrefixes {
-			if strings.HasPrefix(tagVersion, prefix+"-") {
-				isGeneric = true
-				break
-			}
-		}
-	}
-
-	if !isGeneric {
-		return tagVersion
-	}
-
-	// Extract base image name (without registry/tag)
-	imageBaseName := imageName
-	if strings.Contains(imageBaseName, "/") {
-		parts := strings.Split(imageBaseName, "/")
-		imageBaseName = parts[len(parts)-1]
-	}
-	if strings.Contains(imageBaseName, ":") {
-		parts := strings.Split(imageBaseName, ":")
-		imageBaseName = parts[0]
-	}
-
-	// Try image-specific commands first (these are known to work for specific images)
-	type cmdConfig struct {
-		args       []string
-		entrypoint string // empty string means use default entrypoint
-	}
-
-	imageSpecificCommands := map[string][]cmdConfig{
-		"mosquitto": {
-			{args: []string{"mosquitto", "-h"}},
-		},
-		"eclipse-mosquitto": {
-			{args: []string{"mosquitto", "-h"}},
-		},
-		"nginx": {
-			{args: []string{"nginx", "-v"}},
-		},
-		"pure-ftpd": {
-			{args: []string{"pure-ftpd", "--help"}, entrypoint: ""},
-		},
-		"vsftpd": {
-			{args: []string{"vsftpd", "-v"}},
-		},
-	}
-
-	// Try image-specific commands if available
-	if cmds, ok := imageSpecificCommands[imageBaseName]; ok {
-		for _, cfg := range cmds {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-
-			var cmd *exec.Cmd
-			if cfg.entrypoint == "" {
-				// Use empty entrypoint
-				args := append([]string{"run", "--rm", "--entrypoint=", imageName}, cfg.args...)
-				cmd = exec.CommandContext(ctx, "docker", args...)
-			} else {
-				// Use default entrypoint
-				args := append([]string{"run", "--rm", imageName}, cfg.args...)
-				cmd = exec.CommandContext(ctx, "docker", args...)
-			}
-
-			output, err := cmd.CombinedOutput() // Use CombinedOutput to capture stderr too
-			cancel()
-
-			if err == nil && len(output) > 0 {
-				version := parseVersionFromOutput(string(output), tagVersion)
-				if version != tagVersion {
-					return version
-				}
-			}
-		}
-	}
-
-	// Try multiple standard version commands (different containers use different conventions)
-	versionCommands := [][]string{
-		{"--version"},
-		{"-v"},
-		{"-V"},
-		{"version"},
-	}
-
-	for _, cmdArgs := range versionCommands {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		cmd := exec.CommandContext(ctx, "docker", append([]string{"run", "--rm", imageName}, cmdArgs...)...)
-		output, err := cmd.Output()
-		cancel()
-
-		if err == nil && len(output) > 0 {
-			version := parseVersionFromOutput(string(output), tagVersion)
-			if version != tagVersion {
-				return version
-			}
-		}
-	}
-
-	// Fallback: Try to get version from image labels
+// versionFromLabels reads standard/common version labels from a local image.
+// Returns "" if the image is not present locally or has no version label.
+func versionFromLabels(imageName string) string {
 	cmd := exec.Command("docker", "image", "inspect", imageName, "--format", "{{json .Config.Labels}}")
 	output, err := cmd.Output()
-	if err == nil {
-		var labels map[string]string
-		if err := json.Unmarshal(output, &labels); err == nil {
-			// Check standard OCI labels
-			if version, ok := labels["org.opencontainers.image.version"]; ok && version != "" && version != tagVersion {
-				return version
-			}
-			// Check common custom labels
-			if version, ok := labels["version"]; ok && version != "" {
-				return version
-			}
-			if version, ok := labels["VERSION"]; ok && version != "" {
-				return version
+	if err != nil {
+		return ""
+	}
+	var labels map[string]string
+	if err := json.Unmarshal(output, &labels); err != nil {
+		return ""
+	}
+	for _, key := range []string{"org.opencontainers.image.version", "version", "VERSION"} {
+		if v, ok := labels[key]; ok && v != "" {
+			return strings.TrimPrefix(strings.TrimPrefix(v, "v"), "V")
+		}
+	}
+	return ""
+}
+
+// getLocalConfigDigest returns the local image config digest (docker "Id"),
+// e.g. "sha256:abcd…". Empty string means the image is not present locally.
+func getLocalConfigDigest(imageName string) string {
+	cmd := exec.Command("docker", "image", "inspect", imageName, "--format", "{{.Id}}")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+// manifestEntry mirrors the relevant parts of `docker manifest inspect --verbose`.
+// The command returns either a single object (single-arch) or an array (multi-arch).
+type manifestEntry struct {
+	Descriptor struct {
+		Digest   string `json:"digest"`
+		Platform struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
+	} `json:"Descriptor"`
+	SchemaV2Manifest *manifestConfig `json:"SchemaV2Manifest"`
+	OCIManifest      *manifestConfig `json:"OCIManifest"`
+}
+
+type manifestConfig struct {
+	Config struct {
+		Digest string `json:"digest"`
+	} `json:"config"`
+}
+
+func (e manifestEntry) configDigest() string {
+	if e.SchemaV2Manifest != nil && e.SchemaV2Manifest.Config.Digest != "" {
+		return e.SchemaV2Manifest.Config.Digest
+	}
+	if e.OCIManifest != nil {
+		return e.OCIManifest.Config.Digest
+	}
+	return ""
+}
+
+// getRemoteConfigDigest queries the registry for the config digest of an image
+// tag WITHOUT pulling it, using `docker manifest inspect --verbose`. For
+// multi-arch images the entry matching the host platform is selected.
+// Returns an error when the registry cannot be reached / requires auth, so the
+// caller can distinguish "no update" from "could not check".
+func getRemoteConfigDigest(imageName string) (string, error) {
+	var output []byte
+	var lastErr error
+
+	// Retry transient failures once; do NOT retry hard rate limits (pointless
+	// within the window and only makes throttling worse).
+	for attempt := 0; attempt < 2; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cmd := exec.CommandContext(ctx, "docker", "manifest", "inspect", "--verbose", imageName)
+		// manifest inspect must not be treated as experimental-gated on older CLIs.
+		cmd.Env = append(os.Environ(), "DOCKER_CLI_EXPERIMENTAL=enabled")
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		cancel()
+		if err == nil {
+			output = out
+			break
+		}
+		lastErr = fmt.Errorf("manifest inspect failed: %v: %s", err, strings.TrimSpace(stderr.String()))
+		if isRateLimited(stderr.String()) {
+			return "", lastErr
+		}
+		time.Sleep(time.Duration(attempt+1) * time.Second)
+	}
+	if output == nil {
+		return "", lastErr
+	}
+
+	// Try array (multi-arch) first, then single object.
+	var entries []manifestEntry
+	if err := json.Unmarshal(output, &entries); err != nil {
+		var single manifestEntry
+		if err := json.Unmarshal(output, &single); err != nil {
+			return "", fmt.Errorf("could not parse manifest: %w", err)
+		}
+		entries = []manifestEntry{single}
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("empty manifest")
+	}
+
+	// Prefer the entry matching the host platform.
+	for _, e := range entries {
+		if e.Descriptor.Platform.Architecture == runtime.GOARCH && e.Descriptor.Platform.OS == runtime.GOOS {
+			if d := e.configDigest(); d != "" {
+				return d, nil
 			}
 		}
 	}
-
-	// If all else fails, return the tag as-is
-	return tagVersion
-}
-
-// min helper function
-func min(a, b int) int {
-	if a < b {
-		return a
+	// Fall back to the first entry with a config digest.
+	for _, e := range entries {
+		if d := e.configDigest(); d != "" {
+			return d, nil
+		}
 	}
-	return b
+	return "", fmt.Errorf("no config digest in manifest")
 }
 
 // GetRunningContainerInfo gets version info from currently running containers
@@ -475,8 +501,8 @@ func (p *Project) GetRunningContainerInfo() error {
 			tagVersion = parts[len(parts)-1]
 		}
 
-		// Try to get real version for generic tags
-		currentVersion := getRealVersion(imageName, tagVersion)
+		// Try to get real version for generic tags (label-based, no container start)
+		currentVersion := resolveVersion(imageName, tagVersion)
 
 		// Store in ImageInfo (without checking for updates)
 		p.ImageInfo[imageName] = ImageInfo{
@@ -484,19 +510,22 @@ func (p *Project) GetRunningContainerInfo() error {
 			CurrentVersion: currentVersion,
 			LatestVersion:  currentVersion, // Same as current since we're not checking
 			HasUpdate:      false,
+			State:          "ok",
 		}
 	}
 
 	return nil
 }
 
-// UpdateImageInfo updates the image version information for this project
+// UpdateImageInfo refreshes image version information for this project using a
+// lightweight, pull-free check: it compares the local image config digest against
+// the registry's config digest (via `docker manifest inspect`). It never pulls
+// images and never starts containers, so it is safe and fast for cron use.
 func (p *Project) UpdateImageInfo() error {
 	if p.ImageInfo == nil {
 		p.ImageInfo = make(map[string]ImageInfo)
 	}
 
-	// Get images from compose file
 	images, err := p.GetImages()
 	if err != nil {
 		return err
@@ -505,80 +534,59 @@ func (p *Project) UpdateImageInfo() error {
 	hasUpdates := false
 
 	for _, imageName := range images {
-		// Extract tag from image name (e.g., "postgres:15" -> "15")
 		currentTag := "latest"
-		if strings.Contains(imageName, ":") {
-			parts := strings.Split(imageName, ":")
-			currentTag = parts[len(parts)-1]
+		if idx := strings.LastIndex(imageName, ":"); idx >= 0 && !strings.Contains(imageName[idx:], "/") {
+			currentTag = imageName[idx+1:]
 		}
 
-		// Get current local image ID (to compare if update available)
-		cmd := exec.Command("docker", "images", imageName, "--format", "{{.ID}}")
-		output, err := cmd.Output()
-		currentID := strings.TrimSpace(string(output))
+		currentVersion := resolveVersion(imageName, currentTag)
+		localDigest := getLocalConfigDigest(imageName)
 
-		if err != nil || currentID == "" {
-			// Image not pulled yet
+		// Image not present locally at all → must be pulled.
+		if localDigest == "" {
 			p.ImageInfo[imageName] = ImageInfo{
 				Name:           imageName,
-				CurrentVersion: getRealVersion(imageName, currentTag),
+				CurrentVersion: currentVersion,
 				LatestVersion:  "not pulled",
 				HasUpdate:      true,
+				State:          "not-pulled",
 			}
 			hasUpdates = true
 			continue
 		}
 
-		// Get latest image ID from registry (pull with timeout)
-		// Use a 2-minute timeout per image to prevent hanging
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-
-		cmd = exec.CommandContext(ctx, "docker", "pull", "--quiet", imageName)
-		cmd.Dir = p.Path
-		output, err = cmd.CombinedOutput()
-		latestID := ""
-
-		if err == nil {
-			// Get the ID of the pulled image
-			cmd = exec.Command("docker", "images", imageName, "--format", "{{.ID}}")
-			output, _ = cmd.Output()
-			latestID = strings.TrimSpace(string(output))
-		} else if ctx.Err() == context.DeadlineExceeded {
-			// Timeout occurred
+		remoteDigest, err := getRemoteConfigDigest(imageName)
+		if err != nil {
+			// Can't reach registry (offline, auth required, locally-built image).
+			// Don't raise a false alarm — mark as "unknown".
 			p.ImageInfo[imageName] = ImageInfo{
 				Name:           imageName,
-				CurrentVersion: getRealVersion(imageName, currentTag),
-				LatestVersion:  "timeout",
+				CurrentVersion: currentVersion,
+				LatestVersion:  currentVersion,
 				HasUpdate:      false,
+				State:          "unknown",
 			}
 			continue
 		}
 
-		hasUpdate := currentID != latestID && latestID != ""
-
-		// Get real versions for generic tags (latest, stable, etc.)
-		currentVersion := getRealVersion(imageName, currentTag)
-		latestVersion := currentVersion
-
-		if hasUpdate {
-			// Try to get real version of the newly pulled (latest) image
-			latestVersion = getRealVersion(imageName, currentTag)
-		}
-
-		p.ImageInfo[imageName] = ImageInfo{
+		hasUpdate := remoteDigest != "" && remoteDigest != localDigest
+		info := ImageInfo{
 			Name:           imageName,
 			CurrentVersion: currentVersion,
-			LatestVersion:  latestVersion,
+			LatestVersion:  currentVersion,
 			HasUpdate:      hasUpdate,
+			State:          "ok",
 		}
-
 		if hasUpdate {
+			info.State = "update"
+			info.LatestVersion = "update available"
 			hasUpdates = true
 		}
+		p.ImageInfo[imageName] = info
 	}
 
 	p.HasUpdates = hasUpdates
+	p.LastUpdated = time.Now()
 	return nil
 }
 
@@ -592,7 +600,7 @@ func (p *Project) PullOnly() error {
 	// Pull latest images
 	cmd := exec.Command("docker", "compose", "pull", "--quiet")
 	cmd.Dir = p.Path
-	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Stdin = nil                                                           // Prevent docker from detecting TTY
 	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -616,7 +624,7 @@ func (p *Project) Update() error {
 	// Pull latest images
 	cmd := exec.Command("docker", "compose", "pull", "--quiet")
 	cmd.Dir = p.Path
-	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Stdin = nil                                                           // Prevent docker from detecting TTY
 	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -641,7 +649,7 @@ func (p *Project) Update() error {
 	// Recreate containers with new images
 	cmd = exec.Command("docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans")
 	cmd.Dir = p.Path
-	cmd.Stdin = nil // Prevent docker from detecting TTY
+	cmd.Stdin = nil                                                           // Prevent docker from detecting TTY
 	cmd.Env = append(os.Environ(), "COMPOSE_ANSI=never", "DOCKER_BUILDKIT=0") // Disable ANSI and buildkit output
 	output, err = cmd.CombinedOutput()
 	if err != nil {
@@ -677,20 +685,20 @@ func cleanDockerError(operation string, output []byte, err error) error {
 
 		// Skip progress bars and informational output
 		if strings.Contains(line, "Pulling") ||
-		   strings.Contains(line, "Downloaded") ||
-		   strings.Contains(line, "Digest:") ||
-		   strings.Contains(line, "Status:") ||
-		   strings.Contains(line, "Waiting") ||
-		   strings.Contains(line, "Extracting") {
+			strings.Contains(line, "Downloaded") ||
+			strings.Contains(line, "Digest:") ||
+			strings.Contains(line, "Status:") ||
+			strings.Contains(line, "Waiting") ||
+			strings.Contains(line, "Extracting") {
 			continue
 		}
 
 		// Skip Python traceback noise
 		if strings.HasPrefix(line, "Traceback") ||
-		   strings.HasPrefix(line, "File ") ||
-		   strings.Contains(line, "raise error_to_reraise") ||
-		   strings.Contains(line, "raise err from") ||
-		   (strings.Contains(line, "line ") && strings.Contains(line, ".py")) {
+			strings.HasPrefix(line, "File ") ||
+			strings.Contains(line, "raise error_to_reraise") ||
+			strings.Contains(line, "raise err from") ||
+			(strings.Contains(line, "line ") && strings.Contains(line, ".py")) {
 			continue
 		}
 
@@ -713,10 +721,10 @@ func cleanDockerError(operation string, output []byte, err error) error {
 
 		// Look for actual error messages (but not tracebacks)
 		if (strings.Contains(line, "Error") ||
-		    strings.Contains(line, "error") ||
-		    strings.Contains(line, "failed") ||
-		    strings.Contains(line, "cannot")) &&
-		   !strings.Contains(line, "Traceback") {
+			strings.Contains(line, "error") ||
+			strings.Contains(line, "failed") ||
+			strings.Contains(line, "cannot")) &&
+			!strings.Contains(line, "Traceback") {
 			relevantLines = append(relevantLines, line)
 		}
 	}

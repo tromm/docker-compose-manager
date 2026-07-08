@@ -15,12 +15,18 @@ build-all:
 	GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o $(BINARY_NAME)-darwin-amd64 ./cmd
 	GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o $(BINARY_NAME)-darwin-arm64 ./cmd
 
-# Install locally
+# Install locally. Chowns the shared cache dir to the invoking user so that the
+# interactive TUI and the cron job (--update-cache) read/write the SAME file.
 install: build
-	sudo mkdir -p $(CACHE_DIR)
-	sudo chmod 755 $(CACHE_DIR)
 	sudo cp $(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
+	sudo mkdir -p $(CACHE_DIR)
+	sudo chown $(shell id -un):$(shell id -gn) $(CACHE_DIR)
+	sudo chmod 755 $(CACHE_DIR)
 	@echo "✅ Installed to $(INSTALL_DIR)/$(BINARY_NAME)"
+	@echo "📁 Cache dir $(CACHE_DIR) owned by $(shell id -un)"
+	@echo ""
+	@echo "➡  Add this cron entry (crontab -e) to keep updates fresh every 6h:"
+	@echo "   0 */6 * * * $(INSTALL_DIR)/$(BINARY_NAME) --update-cache --cache $(CACHE_DIR)/cache.json /home/dockeruser/docker/ >> $$HOME/.cache/dcm-cron.log 2>&1"
 
 # Uninstall
 uninstall:

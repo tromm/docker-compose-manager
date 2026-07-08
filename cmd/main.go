@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,16 +18,32 @@ const (
 	cacheMaxAge      = 24 * time.Hour // Cache valid for 24 hours
 )
 
-// getCacheFile returns the cache file path
-// Tries system-wide cache first, falls back to user cache
-func getCacheFile() string {
-	// Try system-wide cache first (requires root or proper permissions)
+// getCacheFile resolves the cache file path deterministically so that the cron
+// job (`--update-cache`) and the interactive TUI always agree on ONE file.
+//
+// Precedence:
+//  1. explicit --cache PATH  (passed in via `explicit`)
+//  2. $DCM_CACHE env var
+//  3. system-wide /var/cache/docker-compose-manager/cache.json (if writable)
+//  4. user cache ~/.cache/docker-compose-manager/cache.json
+//
+// To avoid the historic "split-brain" cache (cron writing /var/cache as root
+// while the user reads ~/.cache), install.sh chowns the system cache dir to the
+// user that runs both the cron job and the TUI.
+func getCacheFile(explicit string) string {
+	if explicit != "" {
+		ensureParentDir(explicit)
+		return explicit
+	}
+	if env := os.Getenv("DCM_CACHE"); env != "" {
+		ensureParentDir(env)
+		return env
+	}
+
+	// System-wide cache, but only if this user can actually write it.
 	systemCacheDir := "/var/cache/docker-compose-manager"
 	systemCacheFile := filepath.Join(systemCacheDir, "cache.json")
-
-	// Check if we can write to system cache
-	if err := os.MkdirAll(systemCacheDir, 0755); err == nil {
-		// Try to create a test file to verify write permissions
+	if err := os.MkdirAll(systemCacheDir, 0o755); err == nil {
 		testFile := filepath.Join(systemCacheDir, ".test")
 		if f, err := os.Create(testFile); err == nil {
 			f.Close()
@@ -35,32 +52,34 @@ func getCacheFile() string {
 		}
 	}
 
-	// Fall back to user cache directory
+	// Fall back to user cache directory.
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to get home directory: %v\n", err)
 		os.Exit(1)
 	}
-
 	userCacheDir := filepath.Join(homeDir, ".cache", "docker-compose-manager")
-	if err := os.MkdirAll(userCacheDir, 0755); err != nil {
+	if err := os.MkdirAll(userCacheDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to create cache directory: %v\n", err)
 		os.Exit(1)
 	}
-
 	return filepath.Join(userCacheDir, "cache.json")
 }
 
-func main() {
-	// Get cache file path
-	// Try system-wide cache first (/var/cache), fall back to user cache (~/.cache)
-	cacheFile := getCacheFile()
+// ensureParentDir creates the parent directory of a cache file path.
+func ensureParentDir(path string) {
+	if dir := filepath.Dir(path); dir != "" {
+		os.MkdirAll(dir, 0o755)
+	}
+}
 
+func main() {
 	// Check for flags
 	listMode := false
 	updateCacheMode := false
 	debugMode := false
 	searchDir := defaultSearchDir
+	cachePath := "" // explicit --cache PATH override
 
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -70,13 +89,22 @@ func main() {
 			updateCacheMode = true
 		} else if arg == "--debug" || arg == "-d" {
 			debugMode = true
+		} else if arg == "--cache" {
+			// consume next arg as the cache file path
+			if i+1 < len(os.Args) {
+				cachePath = os.Args[i+1]
+				i++
+			}
+		} else if strings.HasPrefix(arg, "--cache=") {
+			cachePath = strings.TrimPrefix(arg, "--cache=")
 		} else if arg == "--help" || arg == "-h" {
 			fmt.Println("Docker Compose Manager")
 			fmt.Println("\nUsage:")
 			fmt.Println("  docker-compose-manager [OPTIONS] [DIRECTORY]")
 			fmt.Println("\nOptions:")
 			fmt.Println("  -l, --list         List all projects and their status (non-interactive)")
-			fmt.Println("  --update-cache     Update cache with latest image versions (for cron)")
+			fmt.Println("  --update-cache     Refresh cache with available image updates (for cron)")
+			fmt.Println("  --cache PATH       Use an explicit cache file (or set $DCM_CACHE)")
 			fmt.Println("  -d, --debug        Enable debug logging to ~/docker-compose-manager-debug.log")
 			fmt.Println("  -h, --help         Show this help message")
 			fmt.Println("\nExamples:")
@@ -90,6 +118,9 @@ func main() {
 			searchDir = arg
 		}
 	}
+
+	// Resolve the cache file path deterministically (see getCacheFile).
+	cacheFile := getCacheFile(cachePath)
 
 	// Check if search directory exists
 	if _, err := os.Stat(searchDir); os.IsNotExist(err) {

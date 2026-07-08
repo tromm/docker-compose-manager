@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -23,52 +22,67 @@ const (
 
 	ScreenMainMenu Screen = iota
 	ScreenContainerList
-	ScreenContainerDetail       // Show containers in a project (aptitude-style)
+	ScreenContainerDetail // Show containers in a project (aptitude-style)
 	ScreenActionMenu
 	ScreenUpdateList
-	ScreenUpdateModeSelect      // Choose: Pull only or Pull & Restart
-	ScreenUpdateRestartConfirm  // Select which projects to restart
-	ScreenUpdateConfirm         // Old confirmation (kept for compatibility)
+	ScreenUpdateModeSelect     // Choose: Pull only or Pull & Restart
+	ScreenUpdateRestartConfirm // Select which projects to restart
+	ScreenUpdateConfirm        // Old confirmation (kept for compatibility)
 	ScreenUpdating
 	ScreenLoading
-	ScreenHelp                  // Help & Documentation screen
+	ScreenHelp // Help & Documentation screen
 	ScreenConfirmExit
 )
 
 // Model represents the UI state
 type Model struct {
-	projects          []*docker.Project
-	screen            Screen
-	cursor            int
-	selectedProject   *docker.Project
-	selectedUpdates   map[int]bool // Projects selected for update
-	selectedRestarts  map[int]bool // Projects selected for restart (subset of selectedUpdates)
-	updateMode        string       // "pull" or "restart"
-	message           string
-	loading           bool
-	err               error
-	quitting          bool
-	updateProgress       string
-	updatesTotal         int               // Total number of updates
-	updatesCompleted     int               // Number of completed updates
-	projectUpdateStatus  map[int]string    // Status for each project: "pending", "updating", "success", "failed"
-	projectUpdateResult  map[int]string    // Result message for each project
-	currentUpdateIndex   int               // Index of project currently being updated
-	cacheAge             string            // How old is the cache
-	checkingUpdates      bool              // Currently checking for updates
-	currentCheckIndex    int               // Index of project currently being checked (-1 if none)
-	cacheFile            string            // Path to cache file for saving
-	viewportOffset       int               // Scroll offset for long lists
-	width                int               // Terminal width
-	height               int               // Terminal height
-	debugMode            bool              // Enable debug logging
-	viewRenderCount      int               // Count how many times View() is called
+	projects            []*docker.Project
+	screen              Screen
+	cursor              int
+	selectedProject     *docker.Project
+	selectedUpdates     map[int]bool // Projects selected for update
+	selectedRestarts    map[int]bool // Projects selected for restart (subset of selectedUpdates)
+	updateMode          string       // "pull" or "restart"
+	message             string
+	loading             bool
+	err                 error
+	quitting            bool
+	updateProgress      string
+	updatesTotal        int            // Total number of updates
+	updatesCompleted    int            // Number of completed updates
+	projectUpdateStatus map[int]string // Status for each project: "pending", "updating", "success", "failed"
+	projectUpdateResult map[int]string // Result message for each project
+	currentUpdateIndex  int            // Index of project currently being updated
+	cacheAge            string         // How old is the cache
+	checkingUpdates     bool           // Currently checking for updates
+	currentCheckIndex   int            // Index of project currently being checked (-1 if none)
+	cacheFile           string         // Path to cache file for saving
+	viewportOffset      int            // Scroll offset for long lists
+	width               int            // Terminal width
+	height              int            // Terminal height
+	debugMode           bool           // Enable debug logging
+	viewRenderCount     int            // Count how many times View() is called
+	filterUpdatesOnly   bool           // Update list: show only projects with updates
+}
+
+// updateIndices returns the real project indices shown in the update list, in
+// display order, honouring the "updates only" filter.
+func (m Model) updateIndices() []int {
+	idxs := make([]int, 0, len(m.projects))
+	for i, p := range m.projects {
+		if m.filterUpdatesOnly && p.UpdateCount() == 0 {
+			continue
+		}
+		idxs = append(idxs, i)
+	}
+	return idxs
 }
 
 // truncateMiddle truncates a string in the middle if it exceeds maxLen
 // Keeps the last 3 characters visible with "..." in the middle
 // Example: "super-lange-bookworm-version-mit-krass-vielen-zeichen" (maxLen=30)
-//       -> "super-lange-bookworm-ver...hen"
+//
+//	-> "super-lange-bookworm-ver...hen"
 func truncateMiddle(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -88,53 +102,216 @@ func truncateMiddle(s string, maxLen int) string {
 	return prefix + "..." + suffix
 }
 
-// ColumnWidths holds the calculated column widths for the update list
-type ColumnWidths struct {
-	Project    int
-	Image      int
-	Tag        int
-	Local      int
-	Repository int
-}
-
-// calculateColumnWidths returns optimal column widths based on terminal width
-func (m Model) calculateColumnWidths() ColumnWidths {
-	// Fixed columns and padding:
-	// "  " (2) + cursor (1) + " " (1) + Nr (4) + " " (1) + Sel (4) + " " (1) = 14 chars
-	// Padding: after Project (2), Image (2), Tag (2), Local (2), Repo (2) = 10 spaces
-	fixedOverhead := 14 + 10
-
-	// Default widths for small terminals
-	// Project und Image: 50% der Breite von Tag/Lokal/Repo
-	cw := ColumnWidths{
-		Project:    12,  // 50% von 25
-		Image:      12,  // 50% von 25
-		Tag:        25,
-		Local:      25,
-		Repository: 35,
-	}
-
-	// If we have terminal width info, calculate widths ONCE and keep them fixed
-	if m.width > 80 {
-		availableWidth := m.width - fixedOverhead
-
-		// Distribute: Project=10%, Image=10%, Tag=20%, Local=25%, Repository=35%
-		cw.Project = max(12, availableWidth*10/100)
-		cw.Image = max(12, availableWidth*10/100)
-		cw.Tag = max(25, availableWidth*20/100)
-		cw.Local = max(25, availableWidth*25/100)
-		cw.Repository = max(35, availableWidth*35/100)
-	}
-
-	return cw
-}
-
 // max returns the maximum of two integers
 func max(a, b int) int {
 	if a > b {
 		return a
 	}
 	return b
+}
+
+// ── Responsive column layout (k9s-style) ────────────────────────────────────
+//
+// A row is a list of cells. Each cell has a minimum width, may "grow" to fill
+// leftover space, and has a priority. When the terminal is too narrow to fit
+// every cell, the cells with the highest priority number are dropped first
+// (priority 0 is never dropped). This is how important columns survive on small
+// screens instead of the whole table wrapping and garbling.
+
+type cell struct {
+	text  string                 // plain (unstyled) text
+	min   int                    // minimum width in columns
+	grow  bool                   // receives a share of any leftover width
+	prio  int                    // higher = dropped first when space is tight (0 = never)
+	paint func(...string) string // optional per-cell colouring (nil = plain)
+}
+
+const colGap = 2 // spaces between columns
+
+// contentWidth is the usable width inside the bordered/padded box.
+func (m Model) contentWidth() int {
+	w := m.width
+	if w < 20 {
+		w = 80 // sane default before the first WindowSizeMsg arrives
+	}
+	// styleBox: rounded border (2) + horizontal padding (2*2) = 6
+	avail := w - 6
+	if avail < 24 {
+		avail = 24
+	}
+	return avail
+}
+
+// visibleRows returns how many list rows fit given the terminal height,
+// reserving space for the title, header, footer and summary lines.
+func (m Model) visibleRows() int {
+	h := m.height
+	if h < 10 {
+		h = 24 // sane default before the first WindowSizeMsg
+	}
+	rows := h - 11 // title + summary + header + separator + footer + borders
+	if rows < 3 {
+		rows = 3
+	}
+	if rows > 40 {
+		rows = 40
+	}
+	return rows
+}
+
+// keptCells decides which cells fit into avail width (dropping by priority)
+// and returns them together with their final widths, in original order.
+func keptCells(avail int, cells []cell) ([]cell, []int) {
+	keep := make([]bool, len(cells))
+	for i := range cells {
+		keep[i] = true
+	}
+
+	used := func() int {
+		w, n := 0, 0
+		for i, c := range cells {
+			if keep[i] {
+				w += c.min
+				n++
+			}
+		}
+		if n > 1 {
+			w += (n - 1) * colGap
+		}
+		return w
+	}
+
+	// Drop highest-priority cells until it fits (never drop prio 0).
+	for used() > avail {
+		victim, maxPrio := -1, 0
+		for i, c := range cells {
+			if keep[i] && c.prio > maxPrio {
+				maxPrio, victim = c.prio, i
+			}
+		}
+		if victim == -1 {
+			break
+		}
+		keep[victim] = false
+	}
+
+	// Distribute leftover space across growable, kept cells.
+	widths := make([]int, len(cells))
+	for i, c := range cells {
+		widths[i] = c.min
+	}
+	leftover := avail - used()
+	var growers []int
+	for i, c := range cells {
+		if keep[i] && c.grow {
+			growers = append(growers, i)
+		}
+	}
+	if leftover > 0 && len(growers) > 0 {
+		per, rem := leftover/len(growers), leftover%len(growers)
+		for _, i := range growers {
+			widths[i] += per
+			if rem > 0 {
+				widths[i]++
+				rem--
+			}
+		}
+	}
+
+	var out []cell
+	var outW []int
+	for i, c := range cells {
+		if keep[i] {
+			out = append(out, c)
+			outW = append(outW, widths[i])
+		}
+	}
+	return out, outW
+}
+
+// fitCell truncates or right-pads plain text to exactly w columns.
+func fitCell(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	vis := lipgloss.Width(s)
+	if vis == w {
+		return s
+	}
+	if vis < w {
+		return s + strings.Repeat(" ", w-vis)
+	}
+	// Too long: truncate with an ellipsis.
+	if w == 1 {
+		return "…"
+	}
+	runes := []rune(s)
+	// Trim runes until it fits (rune width ~1 for our content).
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > w {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+// clip truncates plain text to at most w columns (with an ellipsis), without
+// padding. Guarantees no single line exceeds the terminal width, which would
+// otherwise make the lipgloss box grow and wrap in the real terminal.
+func clip(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	if w == 1 {
+		return "…"
+	}
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > w {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+// footer renders a help line, falling back to a shorter variant when the full
+// text would not fit the terminal width, clipping as a final safety net.
+func (m Model) footer(full, short string) string {
+	avail := m.contentWidth()
+	txt := full
+	if lipgloss.Width(full) > avail {
+		txt = short
+	}
+	return styleHelp.Render(clip(txt, avail))
+}
+
+// renderRow lays out cells into avail width. When highlight is true the whole
+// row is rendered with the selection style and per-cell colours are suppressed
+// (so the selected row reads as one block, k9s-style).
+func renderRow(avail int, highlight bool, cells []cell) string {
+	kept, widths := keptCells(avail, cells)
+	parts := make([]string, 0, len(kept))
+	for i, c := range kept {
+		s := fitCell(c.text, widths[i])
+		if !highlight && c.paint != nil {
+			s = c.paint(s)
+		}
+		parts = append(parts, s)
+	}
+	line := strings.Join(parts, strings.Repeat(" ", colGap))
+	if highlight {
+		line = styleSelected.Render(line)
+	}
+	return line
+}
+
+// renderSeparator draws a dim rule matching the kept columns of a header row.
+func renderSeparator(avail int, cells []cell) string {
+	kept, widths := keptCells(avail, cells)
+	parts := make([]string, 0, len(kept))
+	for i := range kept {
+		parts = append(parts, strings.Repeat("─", widths[i]))
+	}
+	return styleMuted.Render(strings.Join(parts, strings.Repeat(" ", colGap)))
 }
 
 // NewModel creates a new UI model
@@ -192,6 +369,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "a", "A":
 			return m.handleSelectAll()
+
+		case "o", "O":
+			return m.handleSelectUpdates()
+
+		case "f", "F":
+			return m.handleToggleFilter()
 
 		case "u", "U":
 			return m.handleRefresh()
@@ -367,8 +550,8 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 		if m.cursor < len(m.projects)-1 {
 			m.cursor++
 			// Adjust viewport if cursor moves below visible area
-			if m.cursor >= m.viewportOffset+maxVisibleItems {
-				m.viewportOffset = m.cursor - maxVisibleItems + 1
+			if m.cursor >= m.viewportOffset+m.visibleRows() {
+				m.viewportOffset = m.cursor - m.visibleRows() + 1
 			}
 		}
 
@@ -382,11 +565,11 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 		}
 
 	case ScreenUpdateList:
-		if m.cursor < len(m.projects)-1 {
+		if m.cursor < len(m.updateIndices())-1 {
 			m.cursor++
 			// Adjust viewport if cursor moves below visible area
-			if m.cursor >= m.viewportOffset+maxVisibleItems {
-				m.viewportOffset = m.cursor - maxVisibleItems + 1
+			if m.cursor >= m.viewportOffset+m.visibleRows() {
+				m.viewportOffset = m.cursor - m.visibleRows() + 1
 			}
 		}
 
@@ -610,11 +793,15 @@ func (m Model) handleAction() (tea.Model, tea.Cmd) {
 // handleSpace handles space key for toggling selections
 func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 	if m.screen == ScreenUpdateList {
-		// Toggle selection for current project
-		if m.selectedUpdates[m.cursor] {
-			delete(m.selectedUpdates, m.cursor)
-		} else {
-			m.selectedUpdates[m.cursor] = true
+		// Map cursor (display position) to the real project index.
+		idxs := m.updateIndices()
+		if m.cursor >= 0 && m.cursor < len(idxs) {
+			real := idxs[m.cursor]
+			if m.selectedUpdates[real] {
+				delete(m.selectedUpdates, real)
+			} else {
+				m.selectedUpdates[real] = true
+			}
 		}
 	} else if m.screen == ScreenUpdateRestartConfirm {
 		// Toggle restart selection for current project
@@ -639,17 +826,50 @@ func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleSelectAll handles 'a' key for selecting/deselecting all
+// handleSelectAll handles 'a' key for selecting/deselecting all visible projects
 func (m Model) handleSelectAll() (tea.Model, tea.Cmd) {
 	if m.screen == ScreenUpdateList {
-		// If all selected, deselect all. Otherwise select all
-		if len(m.selectedUpdates) == len(m.projects) {
-			m.selectedUpdates = make(map[int]bool)
+		idxs := m.updateIndices()
+		// If every visible project is already selected, clear; otherwise select all visible.
+		allSelected := len(idxs) > 0
+		for _, i := range idxs {
+			if !m.selectedUpdates[i] {
+				allSelected = false
+				break
+			}
+		}
+		if allSelected {
+			for _, i := range idxs {
+				delete(m.selectedUpdates, i)
+			}
 		} else {
-			for i := range m.projects {
+			for _, i := range idxs {
 				m.selectedUpdates[i] = true
 			}
 		}
+	}
+	return m, nil
+}
+
+// handleSelectUpdates handles 'o' key: select only projects that have updates.
+func (m Model) handleSelectUpdates() (tea.Model, tea.Cmd) {
+	if m.screen == ScreenUpdateList {
+		m.selectedUpdates = make(map[int]bool)
+		for i, p := range m.projects {
+			if p.UpdateCount() > 0 {
+				m.selectedUpdates[i] = true
+			}
+		}
+	}
+	return m, nil
+}
+
+// handleToggleFilter handles 'f' key: toggle "show only projects with updates".
+func (m Model) handleToggleFilter() (tea.Model, tea.Cmd) {
+	if m.screen == ScreenUpdateList {
+		m.filterUpdatesOnly = !m.filterUpdatesOnly
+		m.cursor = 0
+		m.viewportOffset = 0
 	}
 	return m, nil
 }
@@ -681,7 +901,7 @@ func (m Model) handleNumberKey(num int) (tea.Model, tea.Cmd) {
 	case ScreenContainerList:
 		// Container list - select Nth visible project
 		viewStart := m.viewportOffset
-		viewEnd := m.viewportOffset + maxVisibleItems
+		viewEnd := m.viewportOffset + m.visibleRows()
 		if viewEnd > len(m.projects) {
 			viewEnd = len(m.projects)
 		}
@@ -693,11 +913,11 @@ func (m Model) handleNumberKey(num int) (tea.Model, tea.Cmd) {
 		}
 
 	case ScreenUpdateList:
-		// Update list - select Nth visible project
+		// Update list - toggle Nth visible project
 		viewStart := m.viewportOffset
-		viewEnd := m.viewportOffset + maxVisibleItems
-		if viewEnd > len(m.projects) {
-			viewEnd = len(m.projects)
+		viewEnd := m.viewportOffset + m.visibleRows()
+		if viewEnd > len(m.updateIndices()) {
+			viewEnd = len(m.updateIndices())
 		}
 		visibleCount := viewEnd - viewStart
 
@@ -848,9 +1068,18 @@ func (m Model) viewMainMenu() string {
 	b.WriteString(styleTitle.Render("Docker Compose Manager v2.1"))
 	b.WriteString("\n\n")
 
+	// Update summary badge — visible immediately at startup (from cache).
+	b.WriteString(m.summaryBar())
+	b.WriteString("\n\n")
+
+	pu, _ := m.updateSummary()
+	updatesLabel := "Perform Updates"
+	if pu > 0 {
+		updatesLabel = fmt.Sprintf("Perform Updates (%d available)", pu)
+	}
 	options := []string{
 		"Manage Containers (Start/Stop/Restart)",
-		"Perform Updates",
+		updatesLabel,
 		"Help & Documentation",
 	}
 
@@ -862,6 +1091,8 @@ func (m Model) viewMainMenu() string {
 			cursor = styleHighlight.Render(">")
 			option = styleHighlight.Render(option)
 			number = styleHighlight.Render(number)
+		} else if i == 1 && pu > 0 {
+			option = styleUpdate.Render(option)
 		}
 		b.WriteString(fmt.Sprintf("%s %s %s\n", cursor, number, option))
 	}
@@ -877,66 +1108,63 @@ func (m Model) viewMainMenu() string {
 	return styleBox.Render(b.String())
 }
 
-// viewContainerList renders the container list
+// viewContainerList renders the container list (one row per project, k9s-style)
 func (m Model) viewContainerList() string {
 	var b strings.Builder
+	avail := m.contentWidth()
 
 	b.WriteString(styleTitle.Render("Manage Containers"))
+	b.WriteString("\n")
+	b.WriteString(m.summaryBar())
 	b.WriteString("\n\n")
 
-	// Calculate visible range for scrolling
+	// Header row (same column spec as data rows so they align).
+	header := func(nr, name, run, status string) []cell {
+		return []cell{
+			{text: nr, min: 4, prio: 0},
+			{text: "", min: 1, prio: 0}, // glyph column
+			{text: name, min: 12, grow: true, prio: 0},
+			{text: run, min: 5, prio: 2},
+			{text: status, min: 9, prio: 1},
+		}
+	}
+	b.WriteString(renderRow(avail, false, header("#", " ", "RUN", "STATUS")))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(avail, header("#", " ", "RUN", "STATUS")))
+	b.WriteString("\n")
+
+	// Visible range.
+	rows := m.visibleRows()
 	viewStart := m.viewportOffset
-	viewEnd := m.viewportOffset + maxVisibleItems
+	viewEnd := viewStart + rows
 	if viewEnd > len(m.projects) {
 		viewEnd = len(m.projects)
 	}
 
-	// Scroll indicators (fixed space to prevent layout shift)
 	if viewStart > 0 {
-		b.WriteString(styleMuted.Render("▲ More above - scroll up\n"))
-	} else {
-		b.WriteString("\n")
+		b.WriteString(styleMuted.Render("  ▲ more above"))
 	}
+	b.WriteString("\n")
 
 	for i := viewStart; i < viewEnd; i++ {
-		project := m.projects[i]
-		cursor := " "
-		name := project.Name
-		status := project.StatusDisplay()
-
-		// Display absolute position number (1-based index)
-		displayNum := i + 1
-		number := fmt.Sprintf("[%d]", displayNum)
-
-		// Pad the name to fixed width BEFORE styling
-		paddedName := fmt.Sprintf("%-20s", name)
-
-		if m.cursor == i {
-			cursor = styleHighlight.Render(">")
-			number = styleHighlight.Render(number)
-			paddedName = styleHighlight.Render(paddedName)
+		p := m.projects[i]
+		nr := fmt.Sprintf("%d", i+1)
+		cells := []cell{
+			{text: nr, min: 4, prio: 0, paint: styleMuted.Render},
+			{text: glyphChar(p), min: 1, prio: 0, paint: glyphPaint(p)},
+			{text: p.Name, min: 12, grow: true, prio: 0},
+			{text: runDisplay(p), min: 5, prio: 2, paint: statusPaint(p)},
+			{text: projectStatusText(p), min: 9, prio: 1, paint: statusPaint(p)},
 		}
-
-		// Color status
-		statusStyled := status
-		if project.IsRunning() {
-			statusStyled = styleSuccess.Render(status)
-		} else {
-			statusStyled = styleMuted.Render(status)
-		}
-
-		b.WriteString(fmt.Sprintf("%s %s %s %s\n", cursor, number, paddedName, statusStyled))
-	}
-
-	// Bottom scroll indicator (fixed space)
-	if viewEnd < len(m.projects) {
-		b.WriteString(styleMuted.Render("▼ More below - scroll down\n"))
-	} else {
+		b.WriteString(renderRow(avail, m.cursor == i, cells))
 		b.WriteString("\n")
 	}
 
-	b.WriteString("\n")
-	b.WriteString(styleHelp.Render("Use ↑/↓ or 1-9/0 to navigate, Enter to select, Esc/q to go back"))
+	if viewEnd < len(m.projects) {
+		b.WriteString(styleMuted.Render("  ▼ more below"))
+	}
+	b.WriteString("\n\n")
+	b.WriteString(styleHelp.Render("↑/↓ or 1-9/0 navigate · Enter details · Esc/q back"))
 
 	if m.message != "" {
 		b.WriteString("\n\n")
@@ -944,6 +1172,36 @@ func (m Model) viewContainerList() string {
 	}
 
 	return styleBox.Render(b.String())
+}
+
+// glyphPaint returns the colour function matching a project's glyph.
+func glyphPaint(p *docker.Project) func(...string) string {
+	switch {
+	case !p.Checked():
+		return styleMuted.Render
+	case p.UpdateCount() > 0:
+		return styleUpdate.Render
+	case p.FullyUnknown():
+		return styleMuted.Render
+	case p.IsRunning():
+		return styleSuccess.Render
+	default:
+		return styleMuted.Render
+	}
+}
+
+// statusPaint returns the colour function for a project's status/run cells.
+func statusPaint(p *docker.Project) func(...string) string {
+	switch {
+	case p.UpdateCount() > 0:
+		return styleUpdate.Render
+	case p.FullyUnknown():
+		return styleMuted.Render
+	case p.IsRunning():
+		return styleSuccess.Render
+	default:
+		return styleMuted.Render
+	}
 }
 
 // viewActionMenu renders the action menu
@@ -1013,231 +1271,161 @@ func (m Model) viewConfirmExit() string {
 	return styleBox.Render(b.String())
 }
 
-// viewUpdateList renders the update selection screen
+// viewUpdateList renders the update selection screen (one row per project).
 func (m Model) viewUpdateList() string {
 	var b strings.Builder
+	avail := m.contentWidth()
 
 	b.WriteString(styleTitle.Render("Select Projects to Update"))
-	b.WriteString("\n\n")
-
-	// Show cache age and refresh status - PLAIN TEXT
+	if m.filterUpdatesOnly {
+		b.WriteString("  " + styleUpdate.Render("[filter: updates only]"))
+	}
+	b.WriteString("\n")
 	if m.checkingUpdates {
-		b.WriteString("⏳ Checking for updates...")
+		b.WriteString(styleInfo.Render("⏳ Checking registries for updates…"))
 		b.WriteString("\n\n")
-	} else if m.cacheAge != "" {
-		b.WriteString(fmt.Sprintf("Cache updated: %s", m.cacheAge))
-		b.WriteString("\n\n")
-	}
-
-	// Get dynamic column widths
-	cw := m.calculateColumnWidths()
-
-	// Table header - PLAIN TEXT (no styleHighlight)
-	headerLine := fmt.Sprintf("  %s %-4s %-4s %-*s  %-*s  %-*s  %-*s  %-*s",
-		" ", "Nr", "Sel",
-		cw.Project, "Project",
-		cw.Image, "Image",
-		cw.Tag, "Tag",
-		cw.Local, "Lokal",
-		cw.Repository, "Repository")
-	b.WriteString(headerLine)
-	b.WriteString("\n")
-
-	// Separator line - PLAIN TEXT (no styleMuted)
-	separatorLine := fmt.Sprintf("  %s ──── ──── %s  %s  %s  %s  %s",
-		" ", // cursor column
-		strings.Repeat("─", cw.Project),
-		strings.Repeat("─", cw.Image),
-		strings.Repeat("─", cw.Tag),
-		strings.Repeat("─", cw.Local),
-		strings.Repeat("─", cw.Repository))
-	b.WriteString(separatorLine)
-	b.WriteString("\n")
-
-	// Calculate visible range for scrolling
-	viewStart := m.viewportOffset
-	viewEnd := m.viewportOffset + maxVisibleItems
-	if viewEnd > len(m.projects) {
-		viewEnd = len(m.projects)
-	}
-
-	// Show scroll indicators - PLAIN TEXT
-	if viewStart > 0 {
-		b.WriteString("  ▲ More above - scroll up")
-		b.WriteString("\n")
 	} else {
-		b.WriteString("\n") // Empty line to maintain layout
+		b.WriteString(m.summaryBar())
+		b.WriteString("\n")
+		if n := m.unknownImageCount(); n > 0 {
+			b.WriteString(styleMuted.Render(clip(fmt.Sprintf("  ⓘ %d image(s) unreachable (registry rate limit? try 'docker login')", n), m.contentWidth())))
+		}
+		b.WriteString("\n")
 	}
 
-	for i := viewStart; i < viewEnd; i++ {
-		project := m.projects[i]
-		cursor := " "
-		checkbox := "[ ]"
+	// Column spec (shared by header, separator and rows).
+	spec := func(sel, glyph, name, upd, note string) []cell {
+		return []cell{
+			{text: sel, min: 3, prio: 0},
+			{text: glyph, min: 1, prio: 0},
+			{text: name, min: 12, grow: true, prio: 0},
+			{text: upd, min: 5, prio: 1},
+			{text: note, min: 10, grow: true, prio: 2},
+		}
+	}
+	b.WriteString(renderRow(avail, false, spec("", " ", "PROJECT", "UPD", "IMAGES WITH UPDATES")))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(avail, spec("", " ", "PROJECT", "UPD", "IMAGES WITH UPDATES")))
+	b.WriteString("\n")
 
-		if m.selectedUpdates[i] {
+	idxs := m.updateIndices()
+	rows := m.visibleRows()
+	viewStart := m.viewportOffset
+	viewEnd := viewStart + rows
+	if viewEnd > len(idxs) {
+		viewEnd = len(idxs)
+	}
+
+	if viewStart > 0 {
+		b.WriteString(styleMuted.Render("  ▲ more above"))
+	}
+	b.WriteString("\n")
+
+	if len(idxs) == 0 {
+		b.WriteString(styleMuted.Render("  (no projects match the filter — press 'f' to show all)"))
+		b.WriteString("\n")
+	}
+
+	for pos := viewStart; pos < viewEnd; pos++ {
+		real := idxs[pos]
+		p := m.projects[real]
+
+		checkbox := "[ ]"
+		if m.selectedUpdates[real] {
 			checkbox = "[✓]"
 		}
 
-		// Display absolute position number (1-based index)
-		displayNum := i + 1
-		number := fmt.Sprintf("[%d]", displayNum)
-
-		// Show spinner if this project is currently being checked
-		spinner := ""
-		if m.checkingUpdates && m.currentCheckIndex == i {
-			spinner = " ⏳"
+		glyph := glyphChar(p)
+		if m.checkingUpdates && m.currentCheckIndex == real {
+			glyph = "⏳"
 		}
 
-		// Determine if this item is highlighted
-		isHighlighted := (m.cursor == i)
-		if isHighlighted {
-			cursor = "›"
+		upd, note, notePaint := updateCells(p)
+
+		cells := []cell{
+			{text: checkbox, min: 3, prio: 0, paint: checkboxPaint(m.selectedUpdates[real])},
+			{text: glyph, min: 1, prio: 0, paint: glyphPaint(p)},
+			{text: p.Name, min: 12, grow: true, prio: 0},
+			{text: upd, min: 5, prio: 1, paint: statusPaint(p)},
+			{text: note, min: 10, grow: true, prio: 2, paint: notePaint},
 		}
-
-		// Get image info
-		if len(project.ImageInfo) == 0 {
-			// No image info - show project name only with message to refresh
-			// Match exact header format
-			projectNameTrunc := truncateMiddle(project.Name, cw.Project)
-			line := fmt.Sprintf("  %s %-4s %-4s %-*s  ", cursor, number, checkbox, cw.Project, projectNameTrunc)
-			if spinner != "" {
-				line += spinner + " "
-			}
-			line += styleMuted.Render("(press 'u' to update cache)")
-
-			if isHighlighted {
-				// Only highlight the table columns, not the message
-				tablepart := fmt.Sprintf("  %s %-4s %-4s %-*s  ", cursor, number, checkbox, cw.Project, projectNameTrunc)
-				line = styleHighlight.Render(tablepart)
-				if spinner != "" {
-					line += spinner + " "
-				}
-				line += styleMuted.Render("(press 'u' to update cache)")
-			}
-			b.WriteString(line)
-			b.WriteString("\n")
-		} else {
-			// Check if project has any updates
-			hasUpdates := false
-			for _, img := range project.ImageInfo {
-				if img.HasUpdate {
-					hasUpdates = true
-					break
-				}
-			}
-
-			// Sort image names for consistent display order
-			imageNames := make([]string, 0, len(project.ImageInfo))
-			for imgName := range project.ImageInfo {
-				imageNames = append(imageNames, imgName)
-			}
-			sort.Strings(imageNames)
-
-			// Show first image on same line as project name
-			firstImg := true
-			imgCount := 0
-			for _, imgKey := range imageNames {
-				img := project.ImageInfo[imgKey]
-				// Extract image name and tag
-				imgName := img.Name
-				imgTag := "latest"
-
-				if strings.Contains(imgName, "/") {
-					parts := strings.Split(imgName, "/")
-					imgName = parts[len(parts)-1]
-				}
-
-				if strings.Contains(imgName, ":") {
-					parts := strings.Split(imgName, ":")
-					imgName = parts[0]
-					imgTag = parts[1]
-				}
-
-				// Prepare all version data BEFORE building lines
-				localVersion := truncateMiddle(img.CurrentVersion, cw.Local)
-				repoVersion := truncateMiddle(img.LatestVersion, cw.Repository)
-				imgNameTrunc := truncateMiddle(imgName, cw.Image)
-				imgTagTrunc := truncateMiddle(imgTag, cw.Tag)
-
-				// Build complete line
-				var line string
-				if firstImg {
-					// First image: show complete line with project name
-					updateIndicator := "  "
-					if hasUpdates {
-						updateIndicator = "⬆ "
-					}
-					// Build COMPLETE line: 2sp + cursor(1) + sp + number(4) + sp + checkbox(4) + sp + name(16) + indicator(2) + 2sp + image(20) + 2sp + tag(12) + 2sp + local(15) + 2sp + repo
-					projectNameTrunc := truncateMiddle(project.Name, cw.Project-2) // -2 for update indicator
-					line = fmt.Sprintf("  %s %-4s %-4s %-*s%s  %-*s  %-*s  %-*s  %-*s",
-						cursor, number, checkbox,
-						cw.Project-2, projectNameTrunc, updateIndicator,
-						cw.Image, imgNameTrunc,
-						cw.Tag, imgTagTrunc,
-						cw.Local, localVersion,
-						cw.Repository, repoVersion)
-
-					// Add spinner to first image if updating
-					if imgCount == 0 && spinner != "" {
-						line += spinner
-					}
-
-					// Apply highlighting if selected
-					if isHighlighted {
-						line = styleHighlight.Render(line)
-					}
-					firstImg = false
-				} else {
-					// Additional images: empty project columns + version info
-					line = fmt.Sprintf("  %s %-4s %-4s %-*s  %-*s  %-*s  %-*s  %-*s",
-						" ", "", "",
-						cw.Project, "",
-						cw.Image, imgNameTrunc,
-						cw.Tag, imgTagTrunc,
-						cw.Local, localVersion,
-						cw.Repository, repoVersion)
-				}
-
-				b.WriteString(line)
-				b.WriteString("\n")
-				imgCount++
-			}
-
-			// Add separator line after each project (except last in viewport)
-			if i < viewEnd-1 {
-				projectSep := fmt.Sprintf("  ┄┄┄┄ %s  %s  %s  %s  %s",
-					strings.Repeat("─", cw.Project),
-					strings.Repeat("─", cw.Image),
-					strings.Repeat("─", cw.Tag),
-					strings.Repeat("─", cw.Local),
-					strings.Repeat("─", cw.Repository))
-				b.WriteString(styleMuted.Render(projectSep))
-				b.WriteString("\n")
-			}
-		}
-	}
-
-	// Show scroll down indicator - PLAIN TEXT
-	b.WriteString("\n")
-	if viewEnd < len(m.projects) {
-		b.WriteString("  ▼ More below - scroll down")
+		b.WriteString(renderRow(avail, m.cursor == pos, cells))
 		b.WriteString("\n")
-	} else {
-		b.WriteString("\n") // Empty line to maintain layout
 	}
 
-	b.WriteString("\n")
+	if viewEnd < len(idxs) {
+		b.WriteString(styleMuted.Render("  ▼ more below"))
+	}
+	b.WriteString("\n\n")
+
 	selectedCount := len(m.selectedUpdates)
 	if selectedCount > 0 {
-		b.WriteString(fmt.Sprintf("Selected: %d project(s)", selectedCount))
-		b.WriteString("\n")
-	} else {
-		// Always reserve space for the "Selected" line to maintain consistent height
-		b.WriteString("\n")
+		b.WriteString(styleInfo.Render(fmt.Sprintf("Selected: %d project(s)", selectedCount)))
 	}
-	b.WriteString(styleHelp.Render("1-9/0 or Space to select, 'a' select all, 'u' update cache, Enter to continue, Esc/q to go back"))
+	b.WriteString("\n")
+	b.WriteString(m.footer(
+		"Space/1-9 select · a all · o only-updates · f filter · u refresh · Enter continue · Esc/q back",
+		"Space select · a/o/f · u refresh · Enter ok · q back"))
 
 	return styleBox.Render(b.String())
+}
+
+// updateCells returns the "UPD" count cell, a note describing updating images,
+// and the note's colour function.
+func updateCells(p *docker.Project) (upd, note string, notePaint func(...string) string) {
+	if !p.Checked() {
+		return "—", "not checked (press 'u')", styleMuted.Render
+	}
+	n := p.UpdateCount()
+	total := p.ImageCount()
+	unknown := p.UnknownCount()
+	upd = fmt.Sprintf("%d/%d", n, total)
+	if n == 0 {
+		switch {
+		case p.FullyUnknown():
+			return "?", fmt.Sprintf("%d unreachable", unknown), styleMuted.Render
+		case unknown > 0:
+			return upd, fmt.Sprintf("up to date (%d unreachable)", unknown), styleMuted.Render
+		default:
+			return upd, "up to date", styleMuted.Render
+		}
+	}
+	return upd, updatingImageNames(p), styleUpdate.Render
+}
+
+// updatingImageNames lists the base names of images that have an update.
+func updatingImageNames(p *docker.Project) string {
+	keys := make([]string, 0, len(p.ImageInfo))
+	for k := range p.ImageInfo {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var names []string
+	for _, k := range keys {
+		if p.ImageInfo[k].HasUpdate {
+			names = append(names, baseImageName(p.ImageInfo[k].Name))
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// baseImageName strips registry path and tag from an image reference.
+func baseImageName(image string) string {
+	name := image
+	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i:], "/") {
+		name = name[:i]
+	}
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	return name
+}
+
+func checkboxPaint(selected bool) func(...string) string {
+	if selected {
+		return styleSuccess.Render
+	}
+	return styleMuted.Render
 }
 
 // viewUpdateModeSelect renders the update mode selection screen
@@ -1407,21 +1595,38 @@ func (m Model) viewUpdating() string {
 	b.WriteString(styleTitle.Render("Updating Projects"))
 	b.WriteString("\n\n")
 
-	// Overall progress bar
+	avail := m.contentWidth()
+
+	// Overall progress bar (width scales with the terminal).
 	progressPercent := 0
 	if m.updatesTotal > 0 {
 		progressPercent = (m.updatesCompleted * 100) / m.updatesTotal
 	}
-	progressBar := renderProgressBar(progressPercent, 50)
-	b.WriteString(fmt.Sprintf("Overall Progress: %s %3d%% (%d/%d)\n\n",
-		progressBar, progressPercent, m.updatesCompleted, m.updatesTotal))
+	barWidth := avail - 24
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	if barWidth > 50 {
+		barWidth = 50
+	}
+	progressBar := renderProgressBar(progressPercent, barWidth)
+	b.WriteString(clip(fmt.Sprintf("Overall Progress: %s %3d%% (%d/%d)",
+		progressBar, progressPercent, m.updatesCompleted, m.updatesTotal), avail))
+	b.WriteString("\n\n")
 
-	// Table header (no separator line)
-	b.WriteString(styleMuted.Render(fmt.Sprintf("%-4s  %-30s  %-30s  %s\n",
-		"Nr.", "Name", "Ergebnis", "Status")))
+	spec := func(nr, name, result, status string) []cell {
+		return []cell{
+			{text: nr, min: 4, prio: 0},
+			{text: name, min: 12, grow: true, prio: 0},
+			{text: result, min: 8, grow: true, prio: 1},
+			{text: status, min: 3, prio: 0},
+		}
+	}
+	b.WriteString(renderRow(avail, false, spec("#", "NAME", "RESULT", "ST")))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(avail, spec("#", "NAME", "RESULT", "ST")))
 	b.WriteString("\n")
 
-	// Table rows - show all selected projects
 	rowNum := 1
 	for i, project := range m.projects {
 		if !m.selectedUpdates[i] {
@@ -1430,70 +1635,27 @@ func (m Model) viewUpdating() string {
 
 		status := m.projectUpdateStatus[i]
 		result := m.projectUpdateResult[i]
-		statusIcon := ""
 
+		var statusIcon string
+		var paint func(...string) string
 		switch status {
-		case "pending":
-			statusIcon = ""
 		case "updating":
-			statusIcon = "⏳" // Double-width emoji (2 chars)
+			statusIcon, paint = "⏳", styleHighlight.Render
 		case "success":
-			statusIcon = "✓ " // Single-width + space to match hourglass width
+			statusIcon, paint = "✓", styleSuccess.Render
 		case "failed":
-			statusIcon = "✗ " // Single-width + space to match hourglass width
+			statusIcon, paint = "✗", styleError.Render
+		default:
+			statusIcon, paint = "·", styleMuted.Render
 		}
 
-		// Truncate long names and results
-		name := project.Name
-		if len(name) > 30 {
-			name = name[:27] + "..."
+		cells := []cell{
+			{text: fmt.Sprintf("%d", rowNum), min: 4, prio: 0, paint: styleMuted.Render},
+			{text: project.Name, min: 12, grow: true, prio: 0},
+			{text: result, min: 8, grow: true, prio: 1, paint: paint},
+			{text: statusIcon, min: 3, prio: 0, paint: paint},
 		}
-		if len(result) > 30 {
-			result = result[:27] + "..."
-		}
-
-		// Format columns
-		numStr := fmt.Sprintf("%-4d", rowNum)
-		nameStr := fmt.Sprintf("%-30s", name)
-
-		// Result column: color the text, then pad to 30 chars
-		// Use utf8.RuneCountInString to count visible characters, not bytes
-		var resultStr string
-		if result == "" {
-			resultStr = strings.Repeat(" ", 30)
-		} else if status == "success" {
-			visibleLen := utf8.RuneCountInString(result)
-			resultStr = styleSuccess.Render(result) + strings.Repeat(" ", 30-visibleLen)
-		} else if status == "failed" {
-			visibleLen := utf8.RuneCountInString(result)
-			resultStr = styleError.Render(result) + strings.Repeat(" ", 30-visibleLen)
-		} else {
-			visibleLen := utf8.RuneCountInString(result)
-			resultStr = result + strings.Repeat(" ", 30-visibleLen)
-		}
-
-		// Status column: just the icon without padding (no fixed width needed)
-		var statusStr string
-		if statusIcon == "" {
-			statusStr = ""
-		} else if status == "success" {
-			statusStr = styleSuccess.Render(statusIcon)
-		} else if status == "failed" {
-			statusStr = styleError.Render(statusIcon)
-		} else if status == "updating" {
-			statusStr = styleHighlight.Render(statusIcon)
-		} else {
-			statusStr = statusIcon
-		}
-
-		// Build line
-		b.WriteString(numStr)
-		b.WriteString("  ")
-		b.WriteString(nameStr)
-		b.WriteString("  ")
-		b.WriteString(resultStr)
-		b.WriteString("  ")
-		b.WriteString(statusStr)
+		b.WriteString(renderRow(avail, false, cells))
 		b.WriteString("\n")
 
 		rowNum++
@@ -1618,17 +1780,21 @@ func (m Model) viewContainerDetail() string {
 		b.WriteString(styleMuted.Render("No containers running or unable to fetch container information."))
 		b.WriteString("\n")
 	} else {
-		// Column headers
-		b.WriteString(styleHighlight.Render("  Status  "))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-20s  ", "Image")))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-12s  ", "Tag")))
-		b.WriteString(styleHighlight.Render(fmt.Sprintf("%-15s  ", "Lokal")))
-		b.WriteString(styleHighlight.Render("Repository"))
+		avail := m.contentWidth()
+		spec := func(st, name, tag, ver, upd string) []cell {
+			return []cell{
+				{text: st, min: 1, prio: 0},
+				{text: name, min: 12, grow: true, prio: 0},
+				{text: tag, min: 8, prio: 2},
+				{text: ver, min: 8, grow: true, prio: 1},
+				{text: upd, min: 8, prio: 1},
+			}
+		}
+		b.WriteString(renderRow(avail, false, spec(" ", "IMAGE", "TAG", "VERSION", "UPDATE")))
 		b.WriteString("\n")
-		b.WriteString(styleMuted.Render("  ──────  ────────────────────  ────────────  ───────────────  ──────────────"))
+		b.WriteString(renderSeparator(avail, spec(" ", "IMAGE", "TAG", "VERSION", "UPDATE")))
 		b.WriteString("\n")
 
-		// Sort image names for consistent display order
 		imageNames := make([]string, 0, len(m.selectedProject.ImageInfo))
 		for imgName := range m.selectedProject.ImageInfo {
 			imageNames = append(imageNames, imgName)
@@ -1637,36 +1803,28 @@ func (m Model) viewContainerDetail() string {
 
 		for _, imgKey := range imageNames {
 			img := m.selectedProject.ImageInfo[imgKey]
-			// Extract image name and tag
 			imgName := img.Name
 			imgTag := "latest"
-
 			if strings.Contains(imgName, "/") {
 				parts := strings.Split(imgName, "/")
 				imgName = parts[len(parts)-1]
 			}
-
-			// Extract tag from image name
 			if strings.Contains(imgName, ":") {
 				parts := strings.Split(imgName, ":")
 				imgName = parts[0]
 				imgTag = parts[1]
 			}
 
-			// Show image with version
-			status := "✓"
-			statusStyle := styleSuccess
-
-			if img.HasUpdate {
-				status = "⬆"
-				statusStyle = styleHighlight
+			glyph, updText, paint := imageStatusCells(img)
+			cells := []cell{
+				{text: glyph, min: 1, prio: 0, paint: paint},
+				{text: imgName, min: 12, grow: true, prio: 0, paint: styleInfo.Render},
+				{text: imgTag, min: 8, prio: 2, paint: styleMuted.Render},
+				{text: img.CurrentVersion, min: 8, grow: true, prio: 1},
+				{text: updText, min: 8, prio: 1, paint: paint},
 			}
-
-			b.WriteString(statusStyle.Render(fmt.Sprintf("  %-6s  ", status)))
-			b.WriteString(styleInfo.Render(fmt.Sprintf("%-20s  ", truncateMiddle(imgName, 20))))
-			b.WriteString(styleMuted.Render(fmt.Sprintf("%-12s  ", truncateMiddle(imgTag, 12))))
-			b.WriteString(fmt.Sprintf("%-15s  ", truncateMiddle(img.CurrentVersion, 15)))
-			b.WriteString(fmt.Sprintf("%s\n", truncateMiddle(img.LatestVersion, 15)))
+			b.WriteString(renderRow(avail, false, cells))
+			b.WriteString("\n")
 		}
 	}
 
@@ -1674,6 +1832,24 @@ func (m Model) viewContainerDetail() string {
 	b.WriteString(styleHelp.Render("Press Esc/q to go back, Enter to select action"))
 
 	return styleBox.Render(b.String())
+}
+
+// imageStatusCells returns a glyph, an "UPDATE" column label, and the colour for
+// an image based on its State.
+func imageStatusCells(img docker.ImageInfo) (glyph, updText string, paint func(...string) string) {
+	switch img.State {
+	case "update":
+		return "⬆", "available", styleUpdate.Render
+	case "not-pulled":
+		return "⬇", "not pulled", styleUpdate.Render
+	case "unknown":
+		return "?", "unknown", styleMuted.Render
+	default:
+		if img.HasUpdate {
+			return "⬆", "available", styleUpdate.Render
+		}
+		return "✓", "ok", styleSuccess.Render
+	}
 }
 
 // Styles
@@ -1706,7 +1882,139 @@ var (
 
 	styleHelp = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("241"))
+
+	// styleSelected highlights the row under the cursor (k9s-style selection).
+	styleSelected = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("170")).
+			Bold(true)
+
+	// styleUpdate marks images/projects with an available update (amber).
+	styleUpdate = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214")).
+			Bold(true)
+
+	// styleHeader styles table column headers.
+	styleHeader = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("245")).
+			Bold(true)
 )
+
+// ── Project status helpers ───────────────────────────────────────────────────
+
+// glyphChar returns the plain single-column status glyph for a project:
+//
+//	⬆ update available · ✓ running & current · ○ stopped · ? not yet checked
+//
+// Colour is applied separately via glyphPaint so the layout engine can measure
+// the plain width correctly.
+func glyphChar(p *docker.Project) string {
+	switch {
+	case !p.Checked():
+		return "?"
+	case p.UpdateCount() > 0:
+		return "⬆"
+	case p.FullyUnknown():
+		return "?"
+	case p.IsRunning():
+		return "✓"
+	default:
+		return "○"
+	}
+}
+
+// projectStatusText returns a short status word for a project.
+func projectStatusText(p *docker.Project) string {
+	switch {
+	case !p.Checked():
+		return "unchecked"
+	case p.UpdateCount() > 0:
+		return "update"
+	case p.FullyUnknown():
+		return "unknown"
+	case p.IsRunning():
+		return "ok"
+	default:
+		return "stopped"
+	}
+}
+
+// runDisplay returns "running/total" (e.g. "1/1" or "0/2").
+func runDisplay(p *docker.Project) string {
+	if p.TotalServices > 0 {
+		return fmt.Sprintf("%d/%d", p.RunningContainers, p.TotalServices)
+	}
+	return fmt.Sprintf("%d", p.RunningContainers)
+}
+
+// updateSummary returns totals across all projects: number of projects with
+// updates and total images with updates.
+func (m Model) updateSummary() (projectsWithUpdates, imageUpdates int) {
+	for _, p := range m.projects {
+		n := p.UpdateCount()
+		if n > 0 {
+			projectsWithUpdates++
+			imageUpdates += n
+		}
+	}
+	return
+}
+
+// unknownImageCount counts images whose registry state could not be determined.
+func (m Model) unknownImageCount() int {
+	n := 0
+	for _, p := range m.projects {
+		for _, img := range p.ImageInfo {
+			if img.State == "unknown" {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// summaryBar renders the k9s-style header line: counts + cache freshness.
+func (m Model) summaryBar() string {
+	pu, iu := m.updateSummary()
+	anyChecked := false
+	for _, p := range m.projects {
+		if p.Checked() {
+			anyChecked = true
+			break
+		}
+	}
+
+	// Build plain status text plus its colour, so we can measure widths using
+	// the plain text and only apply colour once it is known to fit.
+	var statusPlain string
+	var statusStyle lipgloss.Style
+	switch {
+	case !anyChecked:
+		statusPlain, statusStyle = "updates: not checked ('u' to refresh)", styleMuted
+	case pu == 0:
+		statusPlain, statusStyle = "✓ all up to date", styleSuccess
+	default:
+		statusPlain, statusStyle = fmt.Sprintf("⬆ %d project(s), %d image(s) to update", pu, iu), styleUpdate
+	}
+
+	countPlain := fmt.Sprintf("%d projects · ", len(m.projects))
+	rightPlain := "cache: " + m.calculateCacheAge()
+	avail := m.contentWidth()
+
+	leftW := lipgloss.Width(countPlain) + lipgloss.Width(statusPlain)
+	// Full form: left + gap + right-aligned cache age.
+	if leftW+2+lipgloss.Width(rightPlain) <= avail {
+		gap := avail - leftW - lipgloss.Width(rightPlain)
+		if gap < 2 {
+			gap = 2
+		}
+		return countPlain + statusStyle.Render(statusPlain) + strings.Repeat(" ", gap) + styleMuted.Render(rightPlain)
+	}
+	// Tight: drop the cache age; clip the status if still too long.
+	if leftW <= avail {
+		return countPlain + statusStyle.Render(statusPlain)
+	}
+	return clip(countPlain+statusPlain, avail)
+}
 
 // Messages
 
