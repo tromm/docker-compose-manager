@@ -22,7 +22,9 @@ const (
 
 	ScreenMainMenu Screen = iota
 	ScreenContainerList
-	ScreenContainerDetail // Show containers in a project (aptitude-style)
+	ScreenContainerDetail    // Show containers in a project (aptitude-style)
+	ScreenContainerOpConfirm // Confirm a mass start/stop/restart
+	ScreenContainerOp        // Progress screen for mass start/stop/restart
 	ScreenActionMenu
 	ScreenUpdateList
 	ScreenUpdateModeSelect     // Choose: Pull only or Pull & Restart
@@ -63,6 +65,67 @@ type Model struct {
 	debugMode           bool           // Enable debug logging
 	viewRenderCount     int            // Count how many times View() is called
 	filterUpdatesOnly   bool           // Update list: show only projects with updates
+
+	// Container list: multi-select + filter + mass start/stop/restart.
+	selectedContainers map[int]bool   // Projects selected for a mass operation
+	containerFilter    int            // 0=all, 1=running only, 2=stopped only
+	pendingOp          string         // Mass operation to run: "start"/"stop"/"restart"
+	opTargets          []int          // Real project indices targeted by the mass op
+	opStatus           map[int]string // Per-project op status: pending/running/success/failed
+	opResult           map[int]string // Per-project op result message
+	opTotal            int            // Number of projects in the current mass op
+	opCompleted        int            // Number of completed projects in the current mass op
+}
+
+// containerFilterName returns the label for the active container-list filter.
+func containerFilterName(f int) string {
+	switch f {
+	case 1:
+		return "running"
+	case 2:
+		return "stopped"
+	default:
+		return "all"
+	}
+}
+
+// containerIndices returns the real project indices shown in the container
+// list, honouring the running/stopped filter, in display order.
+func (m Model) containerIndices() []int {
+	idxs := make([]int, 0, len(m.projects))
+	for i, p := range m.projects {
+		switch m.containerFilter {
+		case 1:
+			if !p.IsRunning() {
+				continue
+			}
+		case 2:
+			if p.IsRunning() {
+				continue
+			}
+		}
+		idxs = append(idxs, i)
+	}
+	return idxs
+}
+
+// containerOpTargets returns the real project indices a mass operation would
+// act on: the selected projects, or the row under the cursor if none selected.
+func (m Model) containerOpTargets() []int {
+	targets := make([]int, 0, len(m.selectedContainers))
+	for i, sel := range m.selectedContainers {
+		if sel && i < len(m.projects) {
+			targets = append(targets, i)
+		}
+	}
+	if len(targets) == 0 {
+		idxs := m.containerIndices()
+		if m.cursor >= 0 && m.cursor < len(idxs) {
+			targets = append(targets, idxs[m.cursor])
+		}
+	}
+	sort.Ints(targets)
+	return targets
 }
 
 // updateIndices returns the real project indices shown in the update list, in
@@ -322,6 +385,9 @@ func NewModel(projects []*docker.Project, cacheFile string, debugMode bool) Mode
 		cursor:              0,
 		selectedUpdates:     make(map[int]bool),
 		selectedRestarts:    make(map[int]bool),
+		selectedContainers:  make(map[int]bool),
+		opStatus:            make(map[int]string),
+		opResult:            make(map[int]string),
 		projectUpdateStatus: make(map[int]string),
 		projectUpdateResult: make(map[int]string),
 		currentUpdateIndex:  -1,
@@ -379,6 +445,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "u", "U":
 			return m.handleRefresh()
 
+		case "s", "S":
+			return m.handleContainerOp("start")
+
+		case "x", "X":
+			return m.handleContainerOp("stop")
+
+		case "r", "R":
+			return m.handleContainerOp("restart")
+
 		case "1", "2", "3", "4", "5", "6", "7", "8", "9", "0":
 			// Direct number selection for menus and lists
 			num := int(msg.String()[0] - '0') // Convert char to int
@@ -426,6 +501,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Check if all updates are done
 		if m.updatesCompleted >= m.updatesTotal {
+			m.loading = false
+		}
+		return m, nil
+
+	case containerOpCompleteMsg:
+		m.opCompleted++
+		if msg.success {
+			m.opStatus[msg.projectIndex] = "success"
+			m.opResult[msg.projectIndex] = "✓ OK"
+		} else {
+			m.opStatus[msg.projectIndex] = "failed"
+			m.opResult[msg.projectIndex] = fmt.Sprintf("✗ %v", msg.err)
+		}
+		// Refresh run-state so the container list reflects reality afterwards.
+		if msg.projectIndex >= 0 && msg.projectIndex < len(m.projects) {
+			m.projects[msg.projectIndex].UpdateStatus()
+		}
+		if m.opCompleted >= m.opTotal {
 			m.loading = false
 		}
 		return m, nil
@@ -488,6 +581,24 @@ func (m Model) handleBack() (tea.Model, tea.Cmd) {
 		m.message = ""
 		return m, nil
 
+	case ScreenContainerOpConfirm:
+		m.screen = ScreenContainerList
+		m.cursor = 0
+		m.message = ""
+		return m, nil
+
+	case ScreenContainerOp:
+		// Don't allow leaving while operations are still running.
+		if m.loading {
+			return m, nil
+		}
+		m.screen = ScreenContainerList
+		m.selectedContainers = make(map[int]bool)
+		m.opTargets = nil
+		m.cursor = 0
+		m.message = ""
+		return m, nil
+
 	case ScreenActionMenu:
 		m.screen = ScreenContainerDetail
 		m.cursor = 0
@@ -547,7 +658,7 @@ func (m Model) handleDown() (tea.Model, tea.Cmd) {
 		}
 
 	case ScreenContainerList:
-		if m.cursor < len(m.projects)-1 {
+		if m.cursor < len(m.containerIndices())-1 {
 			m.cursor++
 			// Adjust viewport if cursor moves below visible area
 			if m.cursor >= m.viewportOffset+m.visibleRows() {
@@ -628,13 +739,44 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 		}
 
 	case ScreenContainerList:
-		if m.cursor < len(m.projects) {
-			m.selectedProject = m.projects[m.cursor]
+		idxs := m.containerIndices()
+		if m.cursor >= 0 && m.cursor < len(idxs) {
+			m.selectedProject = m.projects[idxs[m.cursor]]
 			m.screen = ScreenContainerDetail
 			m.cursor = 0
 			m.message = ""
 			return m, nil
 		}
+
+	case ScreenContainerOpConfirm:
+		// Execute the mass operation.
+		m.opStatus = make(map[int]string)
+		m.opResult = make(map[int]string)
+		for _, idx := range m.opTargets {
+			m.opStatus[idx] = "pending"
+			m.opResult[idx] = ""
+		}
+		m.opTotal = len(m.opTargets)
+		m.opCompleted = 0
+		m.loading = true
+		m.screen = ScreenContainerOp
+		return m, tea.Batch(
+			m.performContainerOps(),
+			tea.Tick(100*time.Millisecond, func(time.Time) tea.Msg {
+				return tickMsg{}
+			}),
+		)
+
+	case ScreenContainerOp:
+		// When finished, any Enter returns to the container list.
+		if !m.loading {
+			m.screen = ScreenContainerList
+			m.selectedContainers = make(map[int]bool)
+			m.opTargets = nil
+			m.cursor = 0
+			m.message = ""
+		}
+		return m, nil
 
 	case ScreenContainerDetail:
 		// From container detail, go to action menu
@@ -803,6 +945,17 @@ func (m Model) handleSpace() (tea.Model, tea.Cmd) {
 				m.selectedUpdates[real] = true
 			}
 		}
+	} else if m.screen == ScreenContainerList {
+		// Map cursor (display position) to the real project index.
+		idxs := m.containerIndices()
+		if m.cursor >= 0 && m.cursor < len(idxs) {
+			real := idxs[m.cursor]
+			if m.selectedContainers[real] {
+				delete(m.selectedContainers, real)
+			} else {
+				m.selectedContainers[real] = true
+			}
+		}
 	} else if m.screen == ScreenUpdateRestartConfirm {
 		// Toggle restart selection for current project
 		// Map cursor (display index) to actual project index
@@ -847,7 +1000,43 @@ func (m Model) handleSelectAll() (tea.Model, tea.Cmd) {
 				m.selectedUpdates[i] = true
 			}
 		}
+	} else if m.screen == ScreenContainerList {
+		idxs := m.containerIndices()
+		allSelected := len(idxs) > 0
+		for _, i := range idxs {
+			if !m.selectedContainers[i] {
+				allSelected = false
+				break
+			}
+		}
+		if allSelected {
+			for _, i := range idxs {
+				delete(m.selectedContainers, i)
+			}
+		} else {
+			for _, i := range idxs {
+				m.selectedContainers[i] = true
+			}
+		}
 	}
+	return m, nil
+}
+
+// handleContainerOp handles s/x/r on the container list: build the target set
+// (selected projects, or the cursor row) and go to the confirmation screen.
+func (m Model) handleContainerOp(op string) (tea.Model, tea.Cmd) {
+	if m.screen != ScreenContainerList {
+		return m, nil
+	}
+	targets := m.containerOpTargets()
+	if len(targets) == 0 {
+		return m, nil
+	}
+	m.opTargets = targets
+	m.pendingOp = op
+	m.screen = ScreenContainerOpConfirm
+	m.cursor = 0
+	m.message = ""
 	return m, nil
 }
 
@@ -864,10 +1053,15 @@ func (m Model) handleSelectUpdates() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleToggleFilter handles 'f' key: toggle "show only projects with updates".
+// handleToggleFilter handles 'f' key: on the update list toggle "updates only";
+// on the container list cycle through all → running → stopped.
 func (m Model) handleToggleFilter() (tea.Model, tea.Cmd) {
 	if m.screen == ScreenUpdateList {
 		m.filterUpdatesOnly = !m.filterUpdatesOnly
+		m.cursor = 0
+		m.viewportOffset = 0
+	} else if m.screen == ScreenContainerList {
+		m.containerFilter = (m.containerFilter + 1) % 3
 		m.cursor = 0
 		m.viewportOffset = 0
 	}
@@ -899,17 +1093,17 @@ func (m Model) handleNumberKey(num int) (tea.Model, tea.Cmd) {
 		}
 
 	case ScreenContainerList:
-		// Container list - select Nth visible project
+		// Container list - toggle selection of the Nth visible project
 		viewStart := m.viewportOffset
 		viewEnd := m.viewportOffset + m.visibleRows()
-		if viewEnd > len(m.projects) {
-			viewEnd = len(m.projects)
+		if viewEnd > len(m.containerIndices()) {
+			viewEnd = len(m.containerIndices())
 		}
 		visibleCount := viewEnd - viewStart
 
 		if num >= 1 && num <= visibleCount {
 			m.cursor = viewStart + num - 1
-			return m.handleEnter()
+			return m.handleSpace() // Toggle selection instead of opening details
 		}
 
 	case ScreenUpdateList:
@@ -995,6 +1189,10 @@ func (m Model) View() string {
 		view = m.viewContainerList()
 	case ScreenContainerDetail:
 		view = m.viewContainerDetail()
+	case ScreenContainerOpConfirm:
+		view = m.viewContainerOpConfirm()
+	case ScreenContainerOp:
+		view = m.viewContainerOp()
 	case ScreenActionMenu:
 		view = m.viewActionMenu()
 	case ScreenUpdateList:
@@ -1114,31 +1312,35 @@ func (m Model) viewContainerList() string {
 	avail := m.contentWidth()
 
 	b.WriteString(styleTitle.Render("Manage Containers"))
+	if m.containerFilter != 0 {
+		b.WriteString("  " + styleUpdate.Render("[filter: "+containerFilterName(m.containerFilter)+"]"))
+	}
 	b.WriteString("\n")
 	b.WriteString(m.summaryBar())
 	b.WriteString("\n\n")
 
 	// Header row (same column spec as data rows so they align).
-	header := func(nr, name, run, status string) []cell {
+	header := func(sel, glyph, name, run, status string) []cell {
 		return []cell{
-			{text: nr, min: 4, prio: 0},
-			{text: "", min: 1, prio: 0}, // glyph column
+			{text: sel, min: 3, prio: 0},
+			{text: glyph, min: 1, prio: 0}, // glyph column
 			{text: name, min: 12, grow: true, prio: 0},
 			{text: run, min: 5, prio: 2},
 			{text: status, min: 9, prio: 1},
 		}
 	}
-	b.WriteString(renderRow(avail, false, header("#", " ", "RUN", "STATUS")))
+	b.WriteString(renderRow(avail, false, header("", " ", "PROJECT", "RUN", "STATUS")))
 	b.WriteString("\n")
-	b.WriteString(renderSeparator(avail, header("#", " ", "RUN", "STATUS")))
+	b.WriteString(renderSeparator(avail, header("", " ", "PROJECT", "RUN", "STATUS")))
 	b.WriteString("\n")
 
-	// Visible range.
+	// Visible range over the (possibly filtered) index list.
+	idxs := m.containerIndices()
 	rows := m.visibleRows()
 	viewStart := m.viewportOffset
 	viewEnd := viewStart + rows
-	if viewEnd > len(m.projects) {
-		viewEnd = len(m.projects)
+	if viewEnd > len(idxs) {
+		viewEnd = len(idxs)
 	}
 
 	if viewStart > 0 {
@@ -1147,17 +1349,29 @@ func (m Model) viewContainerList() string {
 	b.WriteString("\n")
 
 	bodyLines := 0
-	for i := viewStart; i < viewEnd; i++ {
-		p := m.projects[i]
-		nr := fmt.Sprintf("%d", i+1)
+	if len(idxs) == 0 {
+		b.WriteString(styleMuted.Render("  (no projects match the filter — press 'f' to cycle)"))
+		b.WriteString("\n")
+		bodyLines++
+	}
+
+	for pos := viewStart; pos < viewEnd; pos++ {
+		real := idxs[pos]
+		p := m.projects[real]
+
+		checkbox := "[ ]"
+		if m.selectedContainers[real] {
+			checkbox = "[✓]"
+		}
+
 		cells := []cell{
-			{text: nr, min: 4, prio: 0, paint: styleMuted.Render},
+			{text: checkbox, min: 3, prio: 0, paint: checkboxPaint(m.selectedContainers[real])},
 			{text: glyphChar(p), min: 1, prio: 0, paint: glyphPaint(p)},
 			{text: p.Name, min: 12, grow: true, prio: 0},
-			{text: runDisplay(p), min: 5, prio: 2, paint: statusPaint(p)},
-			{text: projectStatusText(p), min: 9, prio: 1, paint: statusPaint(p)},
+			{text: runDisplay(p), min: 5, prio: 2, paint: runStatePaint(p)},
+			{text: runStateText(p), min: 9, prio: 1, paint: runStatePaint(p)},
 		}
-		b.WriteString(renderRow(avail, m.cursor == i, cells))
+		b.WriteString(renderRow(avail, m.cursor == pos, cells))
 		b.WriteString("\n")
 		bodyLines++
 	}
@@ -1168,15 +1382,160 @@ func (m Model) viewContainerList() string {
 		b.WriteString("\n")
 	}
 
-	if viewEnd < len(m.projects) {
+	if viewEnd < len(idxs) {
 		b.WriteString(styleMuted.Render("  ▼ more below"))
 	}
-	b.WriteString("\n\n")
-	b.WriteString(styleHelp.Render("↑/↓ or 1-9/0 navigate · Enter details · Esc/q back"))
+	b.WriteString("\n")
+
+	if n := len(m.selectedContainers); n > 0 {
+		b.WriteString(styleInfo.Render(fmt.Sprintf("Selected: %d project(s)", n)))
+	}
+	b.WriteString("\n")
+	b.WriteString(m.footer(
+		"Space/1-9 select · a all · f filter · s start · x stop · r restart · Enter details · Esc/q back",
+		"Space select · a/f · s/x/r ops · Enter details · q back"))
 
 	if m.message != "" {
 		b.WriteString("\n\n")
 		b.WriteString(styleInfo.Render(m.message))
+	}
+
+	return styleBox.Render(b.String())
+}
+
+// opTitle returns a human-readable label for a mass operation.
+func opTitle(op string) string {
+	switch op {
+	case "start":
+		return "Start"
+	case "stop":
+		return "Stop"
+	case "restart":
+		return "Restart"
+	default:
+		return op
+	}
+}
+
+// viewContainerOpConfirm renders the confirmation screen for a mass operation.
+func (m Model) viewContainerOpConfirm() string {
+	var b strings.Builder
+	avail := m.contentWidth()
+
+	b.WriteString(styleTitle.Render(fmt.Sprintf("Confirm: %s %d project(s)", opTitle(m.pendingOp), len(m.opTargets))))
+	b.WriteString("\n\n")
+
+	spec := func(glyph, name, run, status string) []cell {
+		return []cell{
+			{text: glyph, min: 1, prio: 0},
+			{text: name, min: 12, grow: true, prio: 0},
+			{text: run, min: 5, prio: 2},
+			{text: status, min: 9, prio: 1},
+		}
+	}
+	b.WriteString(renderRow(avail, false, spec(" ", "PROJECT", "RUN", "STATUS")))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(avail, spec(" ", "PROJECT", "RUN", "STATUS")))
+	b.WriteString("\n")
+
+	for _, idx := range m.opTargets {
+		if idx < 0 || idx >= len(m.projects) {
+			continue
+		}
+		p := m.projects[idx]
+		cells := []cell{
+			{text: glyphChar(p), min: 1, prio: 0, paint: glyphPaint(p)},
+			{text: p.Name, min: 12, grow: true, prio: 0},
+			{text: runDisplay(p), min: 5, prio: 2, paint: runStatePaint(p)},
+			{text: runStateText(p), min: 9, prio: 1, paint: runStatePaint(p)},
+		}
+		b.WriteString(renderRow(avail, false, cells))
+		b.WriteString("\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString(styleHelp.Render("Enter to confirm · Esc/q to go back"))
+
+	return styleBox.Render(b.String())
+}
+
+// viewContainerOp renders the progress screen for a mass operation.
+func (m Model) viewContainerOp() string {
+	var b strings.Builder
+	avail := m.contentWidth()
+
+	b.WriteString(styleTitle.Render(fmt.Sprintf("%sing Projects", opTitle(m.pendingOp))))
+	b.WriteString("\n\n")
+
+	progressPercent := 0
+	if m.opTotal > 0 {
+		progressPercent = (m.opCompleted * 100) / m.opTotal
+	}
+	barWidth := avail - 24
+	if barWidth < 10 {
+		barWidth = 10
+	}
+	if barWidth > 50 {
+		barWidth = 50
+	}
+	progressBar := renderProgressBar(progressPercent, barWidth)
+	b.WriteString(clip(fmt.Sprintf("Overall Progress: %s %3d%% (%d/%d)",
+		progressBar, progressPercent, m.opCompleted, m.opTotal), avail))
+	b.WriteString("\n\n")
+
+	spec := func(nr, name, result, status string) []cell {
+		return []cell{
+			{text: nr, min: 4, prio: 0},
+			{text: name, min: 12, grow: true, prio: 0},
+			{text: result, min: 8, grow: true, prio: 1},
+			{text: status, min: 3, prio: 0},
+		}
+	}
+	b.WriteString(renderRow(avail, false, spec("#", "NAME", "RESULT", "ST")))
+	b.WriteString("\n")
+	b.WriteString(renderSeparator(avail, spec("#", "NAME", "RESULT", "ST")))
+	b.WriteString("\n")
+
+	rowNum := 1
+	for _, idx := range m.opTargets {
+		if idx < 0 || idx >= len(m.projects) {
+			continue
+		}
+		p := m.projects[idx]
+		status := m.opStatus[idx]
+		result := m.opResult[idx]
+
+		var statusIcon string
+		var paint func(...string) string
+		switch status {
+		case "running":
+			statusIcon, paint = "⏳", styleHighlight.Render
+		case "success":
+			statusIcon, paint = "✓", styleSuccess.Render
+		case "failed":
+			statusIcon, paint = "✗", styleError.Render
+		default:
+			statusIcon, paint = "·", styleMuted.Render
+		}
+
+		cells := []cell{
+			{text: fmt.Sprintf("%d", rowNum), min: 4, prio: 0, paint: styleMuted.Render},
+			{text: p.Name, min: 12, grow: true, prio: 0},
+			{text: result, min: 8, grow: true, prio: 1, paint: paint},
+			{text: statusIcon, min: 3, prio: 0, paint: paint},
+		}
+		b.WriteString(renderRow(avail, false, cells))
+		b.WriteString("\n")
+		rowNum++
+	}
+
+	b.WriteString("\n")
+	if m.loading {
+		b.WriteString(styleInfo.Render(fmt.Sprintf("⏳ %sing %d project(s)...", opTitle(m.pendingOp), m.opTotal)))
+	} else {
+		b.WriteString(styleSuccess.Render("✓ Done!"))
+		b.WriteString("\n\n")
+		b.WriteString(styleHelp.Render("Press Enter or Esc to continue..."))
 	}
 
 	return styleBox.Render(b.String())
@@ -1730,11 +2089,13 @@ func (m Model) viewHelp() string {
 	b.WriteString(styleHighlight.Render("⌨️  Keyboard Shortcuts"))
 	b.WriteString("\n")
 	b.WriteString("  ↑/↓ or k/j      Navigate menu items\n")
-	b.WriteString("  1, 2, 3         Direct menu selection (main menu only)\n")
-	b.WriteString("  Enter           Select item / Confirm action\n")
-	b.WriteString("  Space           Toggle selection (in update/restart lists)\n")
+	b.WriteString("  1-9, 0          Toggle selection of the Nth visible project (in lists)\n")
+	b.WriteString("  Enter           Open details / Confirm action\n")
+	b.WriteString("  Space           Toggle selection (container & update lists)\n")
 	b.WriteString("  a               Select all / Deselect all (in lists)\n")
-	b.WriteString("  r               Refresh update check (in update screen)\n")
+	b.WriteString("  f               Filter (containers: all→running→stopped; updates: updates only)\n")
+	b.WriteString("  s / x / r       Start / Stop / Restart selected containers (container list)\n")
+	b.WriteString("  u               Refresh update check (in update screen)\n")
 	b.WriteString("  Esc or q        Go back to previous screen\n")
 	b.WriteString("  Ctrl+C          Force quit application\n\n")
 
@@ -1748,6 +2109,14 @@ func (m Model) viewHelp() string {
 	b.WriteString("  • Cache System: Fast startup with background update checks\n")
 	b.WriteString("  • Version Display: Shows current and available versions\n")
 	b.WriteString("  • Multi-Select: Update multiple projects at once\n\n")
+
+	b.WriteString(styleHighlight.Render("🚀 Container Workflow (mass start/stop/restart)"))
+	b.WriteString("\n")
+	b.WriteString("  1. Select \"Manage Containers\" from main menu\n")
+	b.WriteString("  2. Optionally press 'f' to filter (all → running → stopped)\n")
+	b.WriteString("  3. Select projects (Space or 1-9, 'a' for all) — or none to act on the row\n")
+	b.WriteString("  4. Press s / x / r to start / stop / restart, confirm with Enter\n")
+	b.WriteString("  5. Enter on a single project opens its details & versions\n\n")
 
 	b.WriteString(styleHighlight.Render("🔄 Update Workflow"))
 	b.WriteString("\n")
@@ -1941,19 +2310,29 @@ func glyphChar(p *docker.Project) string {
 	}
 }
 
-// projectStatusText returns a short status word for a project.
-func projectStatusText(p *docker.Project) string {
+// runStateText returns a short run-state word for the container list, based
+// purely on how many containers are running (never the update status).
+func runStateText(p *docker.Project) string {
 	switch {
-	case !p.Checked():
-		return "unchecked"
-	case p.UpdateCount() > 0:
-		return "update"
-	case p.FullyUnknown():
-		return "unknown"
-	case p.IsRunning():
-		return "ok"
-	default:
+	case p.RunningContainers == 0:
 		return "stopped"
+	case p.TotalServices > 0 && p.RunningContainers >= p.TotalServices:
+		return "running"
+	default:
+		return "partial"
+	}
+}
+
+// runStatePaint colours the run-state cells: green running, amber partial,
+// muted stopped.
+func runStatePaint(p *docker.Project) func(...string) string {
+	switch {
+	case p.RunningContainers == 0:
+		return styleMuted.Render
+	case p.TotalServices > 0 && p.RunningContainers >= p.TotalServices:
+		return styleSuccess.Render
+	default:
+		return styleUpdate.Render
 	}
 }
 
@@ -2046,6 +2425,11 @@ type updateCompleteMsg struct {
 	err          error
 }
 type allUpdatesCompleteMsg struct{}
+type containerOpCompleteMsg struct {
+	projectIndex int
+	success      bool
+	err          error
+}
 type updatesCheckedMsg struct{}
 type projectCheckProgressMsg struct {
 	index int // Index of project being checked
@@ -2074,6 +2458,47 @@ func performOperation(project *docker.Project, operation string) tea.Cmd {
 
 		return operationMsg(fmt.Sprintf("Successfully %sed %s", operation, project.Name))
 	}
+}
+
+// performContainerOps runs the pending mass start/stop/restart on all target
+// projects in parallel, mirroring performUpdates.
+func (m Model) performContainerOps() tea.Cmd {
+	var cmds []tea.Cmd
+
+	for _, idx := range m.opTargets {
+		if idx < 0 || idx >= len(m.projects) {
+			continue
+		}
+
+		// Mark as running immediately (map is shared with the view).
+		m.opStatus[idx] = "running"
+
+		project := m.projects[idx]
+		op := m.pendingOp
+
+		cmd := func(idx int, p *docker.Project, op string) tea.Cmd {
+			return func() tea.Msg {
+				var err error
+				switch op {
+				case "start":
+					err = p.Start()
+				case "stop":
+					err = p.Stop()
+				case "restart":
+					err = p.Restart()
+				}
+				return containerOpCompleteMsg{
+					projectIndex: idx,
+					success:      err == nil,
+					err:          err,
+				}
+			}
+		}(idx, project, op)
+
+		cmds = append(cmds, cmd)
+	}
+
+	return tea.Batch(cmds...)
 }
 
 // performUpdates performs updates for all selected projects in parallel
