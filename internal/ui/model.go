@@ -1146,6 +1146,7 @@ func (m Model) viewContainerList() string {
 	}
 	b.WriteString("\n")
 
+	bodyLines := 0
 	for i := viewStart; i < viewEnd; i++ {
 		p := m.projects[i]
 		nr := fmt.Sprintf("%d", i+1)
@@ -1157,6 +1158,13 @@ func (m Model) viewContainerList() string {
 			{text: projectStatusText(p), min: 9, prio: 1, paint: statusPaint(p)},
 		}
 		b.WriteString(renderRow(avail, m.cursor == i, cells))
+		b.WriteString("\n")
+		bodyLines++
+	}
+
+	// Keep the body height constant so an inline-mode redraw never leaves
+	// ghost rows behind (see viewUpdateList for the same reasoning).
+	for ; bodyLines < rows; bodyLines++ {
 		b.WriteString("\n")
 	}
 
@@ -1321,9 +1329,15 @@ func (m Model) viewUpdateList() string {
 	}
 	b.WriteString("\n")
 
+	// Keep the body height constant (= rows) regardless of how many projects
+	// are visible. In inline mode (no alt-screen) a shrinking frame leaves
+	// ghost rows behind — most visibly the first entry appearing doubled when
+	// toggling the "updates only" filter. Padding to a fixed height avoids it.
+	bodyLines := 0
 	if len(idxs) == 0 {
 		b.WriteString(styleMuted.Render("  (no projects match the filter — press 'f' to show all)"))
 		b.WriteString("\n")
+		bodyLines++
 	}
 
 	for pos := viewStart; pos < viewEnd; pos++ {
@@ -1350,6 +1364,11 @@ func (m Model) viewUpdateList() string {
 			{text: note, min: 10, grow: true, prio: 2, paint: notePaint},
 		}
 		b.WriteString(renderRow(avail, m.cursor == pos, cells))
+		b.WriteString("\n")
+		bodyLines++
+	}
+
+	for ; bodyLines < rows; bodyLines++ {
 		b.WriteString("\n")
 	}
 
